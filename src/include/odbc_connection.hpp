@@ -25,7 +25,6 @@ class ODBCSchemaEntry;
 class ODBCTableEntry;
 class ODBCStatement;
 class ODBCResult;
-struct IndexInfo;
 
 struct OwnedODBCConnection {
 	explicit OwnedODBCConnection(SQLHDBC conn = nullptr, SQLHENV env = nullptr) : connection(conn), environment(env) {
@@ -49,7 +48,7 @@ struct OwnedODBCConnection {
 class ODBCConnection : public enable_shared_from_this<ODBCConnection> {
 public:
 	explicit ODBCConnection(shared_ptr<OwnedODBCConnection> connection, const std::string &dsn_p,
-	                         ODBCTypeConfig type_config_p);
+	                        ODBCTypeConfig type_config_p);
 	~ODBCConnection();
 	// disable copy constructors
 	ODBCConnection(const ODBCConnection &other) = delete;
@@ -64,8 +63,6 @@ public:
 	void Execute(const string &query, vector<Value> params);
 	unique_ptr<ODBCResult> Query(const string &query, ODBCResultStreaming streaming);
 	unique_ptr<ODBCResult> Query(const string &query, vector<Value> params, ODBCResultStreaming streaming);
-
-	vector<IndexInfo> GetIndexInfo(const string &table_name);
 
 	bool IsOpen();
 	void Close();
@@ -87,19 +84,16 @@ public:
 	static void DebugSetPrintQueries(bool print);
 	static bool DebugPrintQueries();
 
-	// 连接状态管理方法
 	bool CheckConnectionHealth();
-	void ResetConnectionState();
-	bool HasPendingResults();
 	void ReleaseConnection();
 
 private:
 	unique_ptr<ODBCResult> QueryInternal(const string &query, vector<Value> params, ODBCResultStreaming streaming,
-	                                      ODBCConnectorInterface con_interface);
+	                                     ODBCConnectorInterface con_interface);
 	idx_t ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming);
 
 	std::recursive_mutex query_lock;
-	std::atomic<bool> connection_busy{false};
+	std::atomic<bool> connection_busy {false};
 	shared_ptr<OwnedODBCConnection> connection;
 	string dsn;
 	ODBCTypeConfig type_config;

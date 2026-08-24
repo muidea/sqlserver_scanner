@@ -1,180 +1,61 @@
 #include "storage/odbc_schema_entry.hpp"
-#include "storage/odbc_table_entry.hpp"
-#include "storage/odbc_transaction.hpp"
-#include "duckdb/parser/parsed_data/create_view_info.hpp"
-#include "duckdb/parser/parsed_data/create_index_info.hpp"
-#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
-#include "duckdb/parser/parsed_data/drop_info.hpp"
-#include "duckdb/parser/constraints/list.hpp"
-#include "duckdb/common/unordered_set.hpp"
-#include "duckdb/parser/expression/columnref_expression.hpp"
-#include "duckdb/parser/parsed_data/alter_info.hpp"
-#include "duckdb/parser/parsed_data/alter_table_info.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
 
 namespace duckdb {
 
 ODBCSchemaEntry::ODBCSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
-    : SchemaCatalogEntry(catalog, info), tables(*this), indexes(*this) {
-}
-
-ODBCTransaction &GetODBCTransaction(CatalogTransaction transaction) {
-	if (!transaction.transaction) {
-		throw InternalException("No transaction!?");
-	}
-	return transaction.transaction->Cast<ODBCTransaction>();
-}
-
-void ODBCSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_type, const string &name) {
-	DropInfo info;
-	info.type = catalog_type;
-	info.name = name;
-	info.cascade = false;
-	info.if_not_found = OnEntryNotFound::RETURN_NULL;
-	DropEntry(context, info);
+    : SchemaCatalogEntry(catalog, info), tables(*this) {
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
-	auto &base_info = info.Base();
-	auto table_name = base_info.table;
-	if (base_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
-		// CREATE OR REPLACE - drop any existing entries first (if any)
-		TryDropEntry(transaction.GetContext(), CatalogType::TABLE_ENTRY, table_name);
-	}
-	return tables.CreateTable(transaction.GetContext(), info);
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
-	throw BinderException("ODBC databases do not support creating functions");
-}
-
-void ODBCUnqualifyColumnRef(ParsedExpression &expr) {
-	if (expr.type == ExpressionType::COLUMN_REF) {
-		auto &colref = expr.Cast<ColumnRefExpression>();
-		auto name = std::move(colref.column_names.back());
-		colref.column_names = {std::move(name)};
-		return;
-	}
-	ParsedExpressionIterator::EnumerateChildren(expr, ODBCUnqualifyColumnRef);
-}
-
-string GetODBCCreateIndex(CreateIndexInfo &info, TableCatalogEntry &tbl) {
-	string sql;
-	sql = "CREATE";
-	if (info.constraint_type == IndexConstraintType::UNIQUE) {
-		sql += " UNIQUE";
-	}
-	sql += " INDEX ";
-	sql += ODBCUtils::WriteIdentifier(info.index_name);
-	sql += " ON ";
-	sql += ODBCUtils::WriteIdentifier(tbl.name);
-	sql += "(";
-	for (idx_t i = 0; i < info.parsed_expressions.size(); i++) {
-		if (i > 0) {
-			sql += ", ";
-		}
-		ODBCUnqualifyColumnRef(*info.parsed_expressions[i]);
-		if (info.parsed_expressions[i]->type == ExpressionType::COLUMN_REF) {
-			// index on column
-			sql += info.parsed_expressions[i]->ToString();
-		} else {
-			// index on expression
-			// expressions need to be wrapped in brackets
-			sql += "(" + info.parsed_expressions[i]->ToString() + ")";
-		}
-	}
-	sql += ")";
-	return sql;
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
-                                                         TableCatalogEntry &table) {
-	auto &odbc_transaction = ODBCTransaction::Get(transaction.GetContext(), table.catalog);
-	odbc_transaction.Query(GetODBCCreateIndex(info, table));
-	return nullptr;
-}
-
-string GetODBCCreateView(CreateViewInfo &info) {
-	string sql;
-	sql = "CREATE VIEW ";
-	sql += ODBCUtils::WriteIdentifier(info.view_name);
-	sql += " ";
-	if (!info.aliases.empty()) {
-		sql += "(";
-		for (idx_t i = 0; i < info.aliases.size(); i++) {
-			if (i > 0) {
-				sql += ", ";
-			}
-			auto &alias = info.aliases[i];
-			sql += ODBCUtils::WriteIdentifier(alias);
-		}
-		sql += ") ";
-	}
-	sql += "AS ";
-	sql += info.query->ToString();
-	return sql;
+                                                        TableCatalogEntry &table) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
-	if (info.sql.empty()) {
-		throw BinderException("Cannot create view in ODBC that originated from an "
-		                      "empty SQL statement");
-	}
-	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT ||
-	    info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-		auto current_entry = GetEntry(transaction, CatalogType::VIEW_ENTRY, info.view_name);
-		if (current_entry) {
-			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-				return current_entry;
-			}
-			// CREATE OR REPLACE - drop any existing entries first (if any)
-			TryDropEntry(transaction.GetContext(), CatalogType::VIEW_ENTRY, info.view_name);
-		}
-	}
-	auto &odbc_transaction = GetODBCTransaction(transaction);
-	odbc_transaction.Query(GetODBCCreateView(info));
-	return tables.RefreshTable(transaction.GetContext(), info.view_name);
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
-	throw BinderException("ODBC databases do not support creating types");
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) {
-	throw BinderException("ODBC databases do not support creating sequences");
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateTableFunction(CatalogTransaction transaction,
-                                                                 CreateTableFunctionInfo &info) {
-	throw BinderException("ODBC databases do not support creating table functions");
+                                                                CreateTableFunctionInfo &info) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateCopyFunction(CatalogTransaction transaction,
-                                                                CreateCopyFunctionInfo &info) {
-	throw BinderException("ODBC databases do not support creating copy functions");
+                                                               CreateCopyFunctionInfo &info) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::CreatePragmaFunction(CatalogTransaction transaction,
-                                                                  CreatePragmaFunctionInfo &info) {
-	throw BinderException("ODBC databases do not support creating pragma functions");
+                                                                 CreatePragmaFunctionInfo &info) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
-optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateCollation(CatalogTransaction transaction,
-                                                             CreateCollationInfo &info) {
-	throw BinderException("ODBC databases do not support creating collations");
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateCollation(CatalogTransaction transaction, CreateCollationInfo &info) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 void ODBCSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
-	if (info.type != AlterType::ALTER_TABLE) {
-		throw BinderException("Only altering tables is supported for now");
-	}
-	auto &alter = info.Cast<AlterTableInfo>();
-	tables.AlterTable(transaction.GetContext(), alter);
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 bool CatalogTypeIsSupported(CatalogType type) {
 	switch (type) {
-	case CatalogType::INDEX_ENTRY:
 	case CatalogType::TABLE_ENTRY:
 	case CatalogType::VIEW_ENTRY:
 		return true;
@@ -184,7 +65,7 @@ bool CatalogTypeIsSupported(CatalogType type) {
 }
 
 void ODBCSchemaEntry::Scan(ClientContext &context, CatalogType type,
-                            const std::function<void(CatalogEntry &)> &callback) {
+                           const std::function<void(CatalogEntry &)> &callback) {
 	if (!CatalogTypeIsSupported(type)) {
 		return;
 	}
@@ -195,11 +76,11 @@ void ODBCSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEnt
 }
 
 void ODBCSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	GetCatalogSet(info.type).DropEntry(context, info);
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaEntry::LookupEntry(CatalogTransaction transaction,
-                                                         const EntryLookupInfo &lookup_info) {
+                                                        const EntryLookupInfo &lookup_info) {
 	auto lookup_type = lookup_info.GetCatalogType();
 	if (!CatalogTypeIsSupported(lookup_type)) {
 		return nullptr;
@@ -207,18 +88,16 @@ optional_ptr<CatalogEntry> ODBCSchemaEntry::LookupEntry(CatalogTransaction trans
 	auto &context = transaction.GetContext();
 	auto entry_name = lookup_info.GetEntryName();
 
-	// First try the existing catalog set (may have been populated by LoadEntries)
+	// A point lookup must not trigger a full schema scan. Large SQL Server owners can
+	// contain thousands of objects, so probe only the requested object and leave
+	// bulk loading to catalog scans such as sqlserver_metadata.
 	auto &catalog_set = GetCatalogSet(lookup_type);
-	auto entry = catalog_set.GetEntry(context, entry_name);
+	auto entry = catalog_set.GetEntryIfLoaded(entry_name);
 	if (entry) {
 		return entry;
 	}
 
-	// If the table was not found in the preloaded catalog set, try to lazily
-	// construct it using a probe query (SELECT * WHERE 1=0). This allows
-	// accessing tables whose metadata rows in INFORMATION_SCHEMA are missing
-	// or corrupted on certain drivers/platforms.
-	if (lookup_type == CatalogType::TABLE_ENTRY) {
+	if (lookup_type == CatalogType::TABLE_ENTRY || lookup_type == CatalogType::VIEW_ENTRY) {
 		try {
 			auto refreshed = tables.RefreshTable(context, entry_name);
 			return refreshed;
@@ -238,8 +117,6 @@ ODBCCatalogSet &ODBCSchemaEntry::GetCatalogSet(CatalogType type) {
 	case CatalogType::TABLE_ENTRY:
 	case CatalogType::VIEW_ENTRY:
 		return tables;
-	case CatalogType::INDEX_ENTRY:
-		return indexes;
 	default:
 		throw InternalException("Type not supported for GetCatalogSet");
 	}

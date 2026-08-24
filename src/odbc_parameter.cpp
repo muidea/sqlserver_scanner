@@ -136,11 +136,16 @@ ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::mo
 		break;
 	case LogicalTypeId::TIMESTAMP_TZ:
 		this->buffer_type = SQL_TYPE_TIMESTAMP;
+		value = value.DefaultCastAs(LogicalType::TIMESTAMP);
 		FillTimestampBuffer(value, bind_buffer);
 		break;
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::VARCHAR:
-		// use string ref from the value
 		this->buffer_type = SQL_VARCHAR;
+		break;
+	case LogicalTypeId::BLOB:
+		this->buffer_type = SQL_VARBINARY;
 		break;
 	default:
 		throw IOException("Unsupported parameters type: \"%s\", ODBC query \"%s\"", value.type(), query.c_str());
@@ -149,10 +154,9 @@ ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::mo
 
 SQLRETURN ODBCParameter::BindParameter(SQLHSTMT stmt, SQLUSMALLINT param_idx) {
 	if (value.IsNull()) {
-		SQLLEN null_indicator = SQL_NULL_DATA;
-		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT,
-		                       SQL_C_DEFAULT, SQL_UNKNOWN_TYPE, 0, 0,
-		                       nullptr, 0, &null_indicator);
+		bind_length = SQL_NULL_DATA;
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 1, 0, nullptr, 0,
+		                        &bind_length);
 	}
 
 	switch (buffer_type) {
@@ -165,21 +169,22 @@ SQLRETURN ODBCParameter::BindParameter(SQLHSTMT stmt, SQLUSMALLINT param_idx) {
 	case SQL_TYPE_DATE:
 	case SQL_TYPE_TIME:
 	case SQL_TYPE_TIMESTAMP:
-		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT,
-		                       ODBCTypes::GetCType(buffer_type), buffer_type,
-		                       bind_buffer.size(), 0,
-		                       bind_buffer.data(), bind_buffer.size(),
-		                       &bind_length);
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, ODBCTypes::GetCType(buffer_type), buffer_type,
+		                        bind_buffer.size(), 0, bind_buffer.data(), bind_buffer.size(), &bind_length);
 	case SQL_VARCHAR: {
 		string str = value.ToString();
 		bind_buffer.resize(str.size() + 1);
 		std::memcpy(bind_buffer.data(), str.c_str(), str.size() + 1);
 		bind_length = str.size();
-		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT,
-		                       SQL_C_CHAR, SQL_VARCHAR,
-		                       str.size(), 0,
-		                       bind_buffer.data(), bind_buffer.size(),
-		                       &bind_length);
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, str.size(), 0,
+		                        bind_buffer.data(), bind_buffer.size(), &bind_length);
+	}
+	case SQL_VARBINARY: {
+		auto blob = StringValue::Get(value);
+		bind_buffer.assign(blob.begin(), blob.end());
+		bind_length = NumericCast<SQLLEN>(bind_buffer.size());
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, bind_buffer.size(), 0,
+		                        bind_buffer.data(), bind_buffer.size(), &bind_length);
 	}
 	default:
 		return SQL_ERROR;

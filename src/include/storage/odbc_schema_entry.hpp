@@ -10,7 +10,6 @@
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "storage/odbc_table_set.hpp"
-#include "storage/odbc_index_set.hpp"
 
 namespace duckdb {
 class ODBCTransaction;
@@ -41,18 +40,10 @@ public:
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 
 private:
-	void AlterTable(ODBCTransaction &transaction, RenameTableInfo &info);
-	void AlterTable(ODBCTransaction &transaction, RenameColumnInfo &info);
-	void AlterTable(ODBCTransaction &transaction, AddColumnInfo &info);
-	void AlterTable(ODBCTransaction &transaction, RemoveColumnInfo &info);
-
-	void TryDropEntry(ClientContext &context, CatalogType catalog_type, const string &name);
-
 	ODBCCatalogSet &GetCatalogSet(CatalogType type);
 
 private:
 	ODBCTableSet tables;
-	ODBCIndexSet indexes;
 };
 
 } // namespace duckdb

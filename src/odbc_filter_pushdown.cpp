@@ -83,7 +83,7 @@ string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &fil
 }
 
 string ODBCFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
-                                             const vector<string> &names) {
+                                            const vector<string> &names) {
 	if (!filters || filters->filters.empty()) {
 		// no filters
 		return string();

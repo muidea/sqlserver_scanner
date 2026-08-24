@@ -70,22 +70,21 @@ static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx
 }
 
 static unique_ptr<FunctionData> ODBCBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<string> &names) {
 	throw InternalException("ODBCBind");
 }
 
-static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &context,
-                                                                 TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ODBCBindData>();
 	// generate the SELECT statement
 	string select;
 	select += "SELECT ";
-	
+
 	// For SQL Server, TOP clause must come immediately after SELECT
 	if (!bind_data.limit.empty()) {
-		select += bind_data.limit;
+		select += "TOP " + bind_data.limit + " ";
 	}
-	
+
 	for (idx_t c = 0; c < input.column_ids.size(); c++) {
 		if (c > 0) {
 			select += ", ";
@@ -117,57 +116,57 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	// run the query
 	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);
 	auto &con = transaction.GetConnection();
-	
+
 	auto query_result = con.Query(select, bind_data.streaming);
-	
+
 	// 检查查询结果是否为空
 	if (!query_result) {
 		throw InternalException("ODBCInitGlobalState: Query returned null result for table %s.%s",
-		                       bind_data.table.schema.name.c_str(), bind_data.table.name.c_str());
+		                        bind_data.table.schema.name.c_str(), bind_data.table.name.c_str());
 	}
-	
+
 	auto result = make_uniq<ODBCGlobalState>(std::move(query_result));
 
 	return std::move(result);
 }
 
 static unique_ptr<LocalTableFunctionState> ODBCInitLocalState(ExecutionContext &context, TableFunctionInitInput &input,
-                                                               GlobalTableFunctionState *global_state) {
+                                                              GlobalTableFunctionState *global_state) {
 	return make_uniq<ODBCLocalState>();
 }
 
 static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &gstate = data.global_state->Cast<ODBCGlobalState>();
-	
+
 	if (!gstate.result) {
 		throw InternalException("ODBCScan: result pointer is null");
 	}
-	
+
 	DataChunk &res_chunk = gstate.result->NextChunk();
-	
+
 	// 空结果集，设置输出为空
 	if (res_chunk.size() == 0) {
 		output.SetCardinality(0);
 		return;
 	}
-	
+
 	// 没有列的结果集，设置输出为空
 	if (res_chunk.ColumnCount() == 0) {
 		output.SetCardinality(0);
 		return;
 	}
-	
+
 	// 检查列数匹配
 	if (output.ColumnCount() != res_chunk.ColumnCount()) {
 		throw InternalException("ODBCScan: column count mismatch. Output has %lu columns, result has %lu columns",
-		                       output.ColumnCount(), res_chunk.ColumnCount());
+		                        output.ColumnCount(), res_chunk.ColumnCount());
 	}
-	
+
 	string error;
 	for (idx_t c = 0; c < output.ColumnCount(); c++) {
 		Vector &output_vec = output.data[c];
 		Vector &res_vec = res_chunk.data[c];
-		
+
 		// 检查向量有效性
 		if (output_vec.GetType().id() == LogicalTypeId::INVALID) {
 			throw InternalException("ODBCScan: output vector %lu has invalid type", c);
@@ -175,7 +174,7 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		if (res_vec.GetType().id() == LogicalTypeId::INVALID) {
 			throw InternalException("ODBCScan: result vector %lu has invalid type", c);
 		}
-		
+
 		// 总是使用 TryCast 进行安全的数据复制，避免引用生命周期问题
 		VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
 
@@ -201,7 +200,7 @@ static InsertionOrderPreservingMap<string> ODBCScanToString(TableFunctionToStrin
 }
 
 static void ODBCScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                               const TableFunction &function) {
+                              const TableFunction &function) {
 	throw NotImplementedException("ODBCScanSerialize");
 }
 
@@ -217,7 +216,7 @@ static BindInfo ODBCGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 }
 
 ODBCScanFunction::ODBCScanFunction()
-    : TableFunction("odbc_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCScan,
+    : TableFunction("sqlserver_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCScan,
                     ODBCBind, ODBCInitGlobalState, ODBCInitLocalState) {
 	to_string = ODBCScanToString;
 	serialize = ODBCScanSerialize;
@@ -229,10 +228,114 @@ ODBCScanFunction::ODBCScanFunction()
 //===--------------------------------------------------------------------===//
 // ODBC Query
 //===--------------------------------------------------------------------===//
+static void ValidateSQLServerReadOnlyQuery(const string &sql) {
+	vector<string> tokens;
+	string token;
+	bool single_quote = false;
+	bool double_quote = false;
+	bool bracket_identifier = false;
+	bool line_comment = false;
+	bool block_comment = false;
+	idx_t statement_terminators = 0;
+
+	auto flush_token = [&]() {
+		if (!token.empty()) {
+			tokens.push_back(StringUtil::Lower(token));
+			token.clear();
+		}
+	};
+	for (idx_t i = 0; i < sql.size(); i++) {
+		auto ch = sql[i];
+		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
+		if (line_comment) {
+			if (ch == '\n') {
+				line_comment = false;
+			}
+			continue;
+		}
+		if (block_comment) {
+			if (ch == '*' && next == '/') {
+				block_comment = false;
+				i++;
+			}
+			continue;
+		}
+		if (single_quote) {
+			if (ch == '\'' && next == '\'') {
+				i++;
+			} else if (ch == '\'') {
+				single_quote = false;
+			}
+			continue;
+		}
+		if (double_quote) {
+			if (ch == '"' && next == '"') {
+				i++;
+			} else if (ch == '"') {
+				double_quote = false;
+			}
+			continue;
+		}
+		if (bracket_identifier) {
+			if (ch == ']' && next == ']') {
+				i++;
+			} else if (ch == ']') {
+				bracket_identifier = false;
+			}
+			continue;
+		}
+		if (ch == '-' && next == '-') {
+			flush_token();
+			line_comment = true;
+			i++;
+		} else if (ch == '/' && next == '*') {
+			flush_token();
+			block_comment = true;
+			i++;
+		} else if (ch == '\'') {
+			flush_token();
+			single_quote = true;
+		} else if (ch == '"') {
+			flush_token();
+			double_quote = true;
+		} else if (ch == '[') {
+			flush_token();
+			bracket_identifier = true;
+		} else if (ch == ';') {
+			flush_token();
+			statement_terminators++;
+		} else if (StringUtil::CharacterIsAlphaNumeric(ch) || ch == '_') {
+			token += ch;
+		} else {
+			flush_token();
+		}
+	}
+	flush_token();
+
+	if (single_quote || double_quote || bracket_identifier || block_comment) {
+		throw PermissionException("sqlserver_query contains an unterminated literal, identifier, or comment");
+	}
+	if (tokens.empty() || (tokens[0] != "select" && tokens[0] != "with")) {
+		throw PermissionException("sqlserver_query only accepts SELECT or WITH queries");
+	}
+	auto trimmed_sql = sql;
+	StringUtil::Trim(trimmed_sql);
+	if (statement_terminators > 1 || (statement_terminators == 1 && !StringUtil::EndsWith(trimmed_sql, ";"))) {
+		throw PermissionException("sqlserver_query accepts exactly one read-only statement");
+	}
+	unordered_set<string> forbidden = {"insert", "update", "delete",   "merge", "exec",   "execute", "create",
+	                                   "alter",  "drop",   "truncate", "grant", "revoke", "deny",    "use"};
+	for (auto &entry : tokens) {
+		if (forbidden.find(entry) != forbidden.end()) {
+			throw PermissionException("sqlserver_query only accepts read-only queries");
+		}
+	}
+}
+
 static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
-		throw BinderException("Parameters to odbc_query cannot be NULL");
+		throw BinderException("Parameters to sqlserver_query cannot be NULL");
 	}
 
 	// look up the database to query
@@ -240,21 +343,22 @@ static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunct
 	auto &db_manager = DatabaseManager::Get(context);
 	auto db = db_manager.GetDatabase(context, db_name);
 	if (!db) {
-		throw BinderException("Failed to find attached database \"%s\" referenced in odbc_query", db_name);
+		throw BinderException("Failed to find attached database \"%s\" referenced in sqlserver_query", db_name);
 	}
 	auto &catalog = db->GetCatalog();
-	if (catalog.GetCatalogType() != "odbc") {
-		throw BinderException("Attached database \"%s\" does not refer to a ODBC database", db_name);
+	if (catalog.GetCatalogType() != "sqlserver") {
+		throw BinderException("Attached database \"%s\" does not refer to a SQL Server database", db_name);
 	}
 	auto &transaction = ODBCTransaction::Get(context, catalog);
 	auto sql = input.inputs[1].GetValue<string>();
+	ValidateSQLServerReadOnlyQuery(sql);
 
 	vector<Value> params;
 	auto params_it = input.named_parameters.find("params");
 	if (params_it != input.named_parameters.end()) {
 		Value &struct_val = params_it->second;
 		if (struct_val.IsNull()) {
-			throw BinderException("Parameters to odbc_query cannot be NULL");
+			throw BinderException("Parameters to sqlserver_query cannot be NULL");
 		}
 		if (struct_val.type().id() != LogicalTypeId::STRUCT) {
 			throw BinderException("Query parameters must be specified in a STRUCT");
@@ -262,8 +366,7 @@ static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunct
 		params = StructValue::GetChildren(struct_val);
 	}
 
-	auto result =
-	    transaction.GetConnection().Query(sql, std::move(params), ODBCResultStreaming::FORCE_MATERIALIZATION);
+	auto result = transaction.GetConnection().Query(sql, std::move(params), ODBCResultStreaming::FORCE_MATERIALIZATION);
 	for (auto &field : result->Fields()) {
 		names.push_back(field.name);
 		return_types.push_back(field.duckdb_type);
@@ -275,7 +378,7 @@ static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunct
 }
 
 static unique_ptr<GlobalTableFunctionState> ODBCQueryInitGlobalState(ClientContext &context,
-                                                                      TableFunctionInitInput &input) {
+                                                                     TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->CastNoConst<ODBCQueryBindData>();
 	unique_ptr<ODBCResult> odbc_result;
 	if (bind_data.result) {
@@ -289,7 +392,7 @@ static unique_ptr<GlobalTableFunctionState> ODBCQueryInitGlobalState(ClientConte
 }
 
 ODBCQueryFunction::ODBCQueryFunction()
-    : TableFunction("odbc_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCScan, ODBCQueryBind,
+    : TableFunction("sqlserver_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCScan, ODBCQueryBind,
                     ODBCQueryInitGlobalState, ODBCInitLocalState) {
 	serialize = ODBCScanSerialize;
 	deserialize = ODBCScanDeserialize;

@@ -1,6 +1,6 @@
 # 构建指南
 
-本文档介绍如何在不同平台上构建 odbc-scanner DuckDB 扩展。
+本文档介绍如何在不同平台上构建 sqlserver_scanner DuckDB 扩展。
 
 ## 前置条件
 
@@ -70,7 +70,7 @@ $env:VCPKG_ROOT="C:\vcpkg"
 
 ```bash
 # 在项目父目录安装
-cd /path/to/workspace  # 假设项目在 /path/to/workspace/odbc-scanner
+cd /path/to/workspace  # 假设项目在 /path/to/workspace/sqlserver_scanner
 git clone https://github.com/microsoft/vcpkg.git
 cd vcpkg
 
@@ -258,7 +258,7 @@ make help
 
 输出示例：
 ```
-odbc-scanner - DuckDB ODBC Extension
+sqlserver_scanner - DuckDB ODBC Extension
 
 Available targets:
   make release       - Build release version
@@ -438,7 +438,7 @@ LINUX_CI_IN_DOCKER=1 make test
 ## 依赖关系图
 
 ```
-odbc-scanner
+sqlserver_scanner
 │
 ├── ODBC SDK
 │   ├── Linux: unixodbc (vcpkg)
@@ -514,10 +514,10 @@ odbc-scanner
 4. **连接字符串示例**：
    ```sql
    -- 使用 DSN 配置
-   D ATTACH 'DSN=mssql2000;UID=sa;PWD=password;' AS db1 (TYPE odbc_scanner);
+   D ATTACH 'DSN=mssql2000;UID=sa;PWD=password;' AS db1 (TYPE sqlserver_scanner, READ_ONLY);
    
    -- 使用 Driver 连接
-   D ATTACH 'Driver={FreeTDS};Server=192.168.1.100;Port=1433;Database=mydb;UID=sa;PWD=password;' AS db2 (TYPE odbc_scanner);
+   D ATTACH 'Driver={FreeTDS};Server=192.168.1.100;Port=1433;Database=mydb;UID=sa;PWD=password;' AS db2 (TYPE sqlserver_scanner, READ_ONLY);
    ```
 
 **注意：** 代码会自动在 Linux 上添加 `ClientCharset=UTF-8` 和 `TDS_Version=8.0` 参数。
@@ -535,13 +535,13 @@ Windows 系统自带 SQL Server ODBC 驱动，无需额外安装。
 2. **连接字符串示例**：
    ```sql
    -- SQL Server 驱动（推荐）
-   D ATTACH 'Driver={SQL Server};Server=192.168.1.100,1433;Database=mydb;UID=sa;PWD=password;' AS db1 (TYPE odbc_scanner);
+   D ATTACH 'Driver={SQL Server};Server=192.168.1.100,1433;Database=mydb;UID=sa;PWD=password;' AS db1 (TYPE sqlserver_scanner, READ_ONLY);
    
    -- 命名实例
-   D ATTACH 'Driver={SQL Server};Server=192.168.1.100\INSTANCE;Database=mydb;UID=sa;PWD=password;' AS db2 (TYPE odbc_scanner);
+   D ATTACH 'Driver={SQL Server};Server=192.168.1.100\INSTANCE;Database=mydb;UID=sa;PWD=password;' AS db2 (TYPE sqlserver_scanner, READ_ONLY);
    
    -- ODBC Driver 17 for SQL Server（如果已安装）
-   D ATTACH 'Driver={ODBC Driver 17 for SQL Server};Server=192.168.1.100;Database=mydb;UID=sa;PWD=password;' AS db3 (TYPE odbc_scanner);
+   D ATTACH 'Driver={ODBC Driver 17 for SQL Server};Server=192.168.1.100;Database=mydb;UID=sa;PWD=password;' AS db3 (TYPE sqlserver_scanner, READ_ONLY);
    ```
 
 **注意：** 
@@ -566,7 +566,7 @@ Windows 系统自带 SQL Server ODBC 驱动，无需额外安装。
 
 2. **使用 DSN 连接**：
    ```sql
-   D ATTACH 'DSN=mydb;' AS mydb (TYPE odbc_scanner);
+   D ATTACH 'DSN=mydb;' AS mydb (TYPE sqlserver_scanner, READ_ONLY);
    ```
 
 ## CI/CD 集成

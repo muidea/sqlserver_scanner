@@ -1,17 +1,17 @@
 #include "storage/odbc_schema_set.hpp"
-#include "storage/odbc_transaction.hpp"
-#include "duckdb/parser/parsed_data/create_schema_info.hpp"
+
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "storage/odbc_catalog.hpp"
+#include "storage/odbc_transaction.hpp"
+
 #include <algorithm>
 
 namespace duckdb {
 
 static bool ODBCSchemaIsInternal(const string &name) {
 	auto lower = StringUtil::Lower(name);
-	if (lower == "information_schema" || lower == "performance_schema" || lower == "sys") {
-		return true;
-	}
-	return false;
+	return lower == "information_schema" || lower == "sys" || lower == "guest";
 }
 
 static string NormalizeSchemaName(string name) {
@@ -24,92 +24,60 @@ ODBCSchemaSet::ODBCSchemaSet(Catalog &catalog) : ODBCCatalogSet(catalog) {
 }
 
 void ODBCSchemaSet::LoadEntries(ClientContext &context) {
-	// Use standard ODBC catalog functions or INFORMATION_SCHEMA for schema enumeration
-	auto query = R"(
+	auto &transaction = ODBCTransaction::Get(context, catalog);
+	vector<string> schema_names;
+	try {
+		auto result = transaction.Query(R"(
+SELECT name
+FROM sys.schemas
+ORDER BY name
+)");
+		while (result->Next()) {
+			auto schema_name = NormalizeSchemaName(result->GetString(0));
+			if (!schema_name.empty() && !ODBCSchemaIsInternal(schema_name)) {
+				schema_names.push_back(std::move(schema_name));
+			}
+		}
+	} catch (...) {
+		try {
+			auto result = transaction.Query(R"(
 SELECT SCHEMA_NAME
 FROM INFORMATION_SCHEMA.SCHEMATA
-ORDER BY SCHEMA_NAME;
-)";
-
-
-	auto &transaction = ODBCTransaction::Get(context, catalog);
-	auto result = transaction.Query(query);
-	
-	int schema_count = 0;
-	vector<string> schema_names;
-	while (result->Next()) {
-		schema_count++;
-		CreateSchemaInfo info;
-		info.schema = NormalizeSchemaName(result->GetString(0));
-		if (info.schema.empty()) {
-			continue;
-		}
-		if (ODBCSchemaIsInternal(info.schema)) {
-			continue;
-		}
-		info.internal = false;
-		auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
-		CreateEntry(std::move(schema));
-		schema_names.push_back(info.schema);
-	}
-	
-	
-	// Print usage information for the user
-	//if (!schema_names.empty()) {
-	//	// User-friendly schema information is now handled at a higher level
-	//	// This avoids cluttering the output with debug information
-	//}
-	
-	// If no schemas found with INFORMATION_SCHEMA, try alternative methods
-	if (schema_count == 0) {
-		
-		// Try SQL Server specific query as fallback
-		auto fallback_query = R"(
-SELECT name AS schema_name
-FROM sys.schemas;
-)";
-		auto fallback_result = transaction.Query(fallback_query);
-		while (fallback_result->Next()) {
-			schema_count++;
-			CreateSchemaInfo info;
-			info.schema = NormalizeSchemaName(fallback_result->GetString(0));
-			if (info.schema.empty()) {
-				continue;
+ORDER BY SCHEMA_NAME
+)");
+			while (result->Next()) {
+				auto schema_name = NormalizeSchemaName(result->GetString(0));
+				if (!schema_name.empty() && !ODBCSchemaIsInternal(schema_name)) {
+					schema_names.push_back(std::move(schema_name));
+				}
 			}
-			if (ODBCSchemaIsInternal(info.schema)) {
-				continue;
-			}
-			info.internal = false;
-			auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
-			CreateEntry(std::move(schema));
-			schema_names.push_back(info.schema);
+		} catch (...) {
 		}
 	}
 
-	// Ensure SQL Server default schema is available even under metadata encoding issues
-	bool has_dbo = false;
+	auto default_schema = catalog.Cast<ODBCCatalog>().GetDefaultSchema();
+	if (!default_schema.empty()) {
+		schema_names.push_back(default_schema);
+	}
+	if (schema_names.empty()) {
+		schema_names.emplace_back("dbo");
+	}
+
+	unordered_set<string> created;
 	for (auto &schema_name : schema_names) {
-		if (StringUtil::CIEquals(schema_name, "dbo")) {
-			has_dbo = true;
-			break;
+		auto normalized = NormalizeSchemaName(std::move(schema_name));
+		if (normalized.empty() || ODBCSchemaIsInternal(normalized) || !created.insert(normalized).second) {
+			continue;
 		}
-	}
-	if (!has_dbo) {
 		CreateSchemaInfo info;
-		info.schema = "dbo";
+		info.schema = std::move(normalized);
 		info.internal = false;
-		auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
-		CreateEntry(std::move(schema));
+		CreateEntry(make_uniq<ODBCSchemaEntry>(catalog, info));
 	}
 }
 
 optional_ptr<CatalogEntry> ODBCSchemaSet::CreateSchema(ClientContext &context, CreateSchemaInfo &info) {
-	auto &transaction = ODBCTransaction::Get(context, catalog);
-
-	string create_sql = "CREATE SCHEMA " + ODBCUtils::WriteIdentifier(info.schema);
-	transaction.Query(create_sql);
-	auto schema_entry = make_uniq<ODBCSchemaEntry>(catalog, info);
-	return CreateEntry(std::move(schema_entry));
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 } // namespace duckdb

@@ -13,6 +13,10 @@ optional_ptr<CatalogEntry> ODBCCatalogSet::GetEntry(ClientContext &context, cons
 		is_loaded = true;
 		LoadEntries(context);
 	}
+	return GetEntryIfLoaded(name);
+}
+
+optional_ptr<CatalogEntry> ODBCCatalogSet::GetEntryIfLoaded(const string &name) {
 	lock_guard<mutex> l(entry_lock);
 	auto entry = entries.find(name);
 	if (entry == entries.end()) {
@@ -22,22 +26,7 @@ optional_ptr<CatalogEntry> ODBCCatalogSet::GetEntry(ClientContext &context, cons
 }
 
 void ODBCCatalogSet::DropEntry(ClientContext &context, DropInfo &info) {
-	string drop_query = "DROP ";
-	drop_query += CatalogTypeToString(info.type) + " ";
-	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
-		drop_query += " IF EXISTS ";
-	}
-	drop_query += ODBCUtils::WriteIdentifier(info.name);
-	if (info.type != CatalogType::SCHEMA_ENTRY) {
-		if (info.cascade) {
-			drop_query += " CASCADE";
-		}
-	}
-	auto &transaction = ODBCTransaction::Get(context, catalog);
-	transaction.Query(drop_query);
-
-	// erase the entry from the catalog set
-	EraseEntryInternal(info.name);
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 void ODBCCatalogSet::EraseEntryInternal(const string &name) {

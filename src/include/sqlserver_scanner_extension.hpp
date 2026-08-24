@@ -8,14 +8,14 @@
 
 using namespace duckdb;
 
-class ODBCScannerExtension : public Extension {
+class SQLServerScannerExtension : public Extension {
 public:
 	std::string Name() override {
-		return "odbc_scanner";
+		return "sqlserver_scanner";
 	}
 	void Load(ExtensionLoader &loader) override;
 };
 
 extern "C" {
-DUCKDB_CPP_EXTENSION_ENTRY(odbc_scanner, loader);
+DUCKDB_CPP_EXTENSION_ENTRY(sqlserver_scanner, loader);
 }

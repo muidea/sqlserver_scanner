@@ -1,19 +1,47 @@
+# sqlserver_scanner
 
-duckdb.exe -unsigned
+DuckDB read-only scanner for Microsoft SQL Server through unixODBC/Windows ODBC.
 
+## Build
 
-load odbc_scanner;
+```bash
+make release
+make test_release
+```
 
+## Load and attach
 
-ATTACH 'Driver={SQL Server};Server=192.168.235.182,1433;Database=master;UID=sa;PWD=Supos1304;' AS "fqe_MSSL2000" (TYPE odbc_scanner);
+Use a DuckDB secret so credentials are redacted from catalog output:
 
-ATTACH 'Driver={SQL Server};Server=192.168.18.14\LWLTEST,55954;Database=master;UID=sa;PWD=Supos1304;' AS "fqe_MSSL2016" (TYPE odbc_scanner);
+```sql
+LOAD sqlserver_scanner;
 
-ATTACH 'Driver={freeTDS};Server=192.168.235.182,1433;Database=master;UID=sa;PWD=Supos1304;' AS "fqe_MSSL2000" (TYPE odbc_scanner);
+CREATE SECRET sqlserver_source (
+    TYPE sqlserver,
+    DRIVER 'FreeTDS',
+    SERVER 'sqlserver.example',
+    PORT '1433',
+    DATABASE 'application',
+    UID 'reader',
+    PWD 'secret'
+);
 
-ATTACH 'Driver={freeTDS};Server=192.168.18.14\LWLTEST,55954;Database=master;UID=sa;PWD=Supos1304;' AS "fqe_MSSL2016" (TYPE odbc_scanner);
+ATTACH '' AS mssql (
+    TYPE sqlserver_scanner,
+    READ_ONLY,
+    SECRET sqlserver_source,
+    SCHEMA 'dbo'
+);
 
+SELECT * FROM mssql.dbo.example_table;
+SELECT * FROM sqlserver_metadata('mssql', 'dbo');
+SELECT * FROM sqlserver_query('mssql', 'SELECT TOP 10 * FROM dbo.example_table');
+```
 
-SELECT * FROM fqe_mssl2016.dbo.alltypestable;
+`sqlserver_query` accepts exactly one read-only `SELECT` or `WITH` statement. The catalog rejects create,
+insert, update, delete, index, and schema mutations.
 
-SELECT * FROM fqe_mssl2000.dbo.t1 UNION SELECT * FROM fqe_mssl2000.dbo.t2;
+## Linux driver
+
+The extension links to unixODBC. Install a SQL Server ODBC driver separately, for example FreeTDS or Microsoft
+ODBC Driver 18, and use its registered driver name in the secret.

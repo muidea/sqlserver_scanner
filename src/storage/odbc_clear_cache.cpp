@@ -26,7 +26,7 @@ static void ClearODBCCaches(ClientContext &context) {
 	for (auto &db_ref : databases) {
 		auto &db = *db_ref;
 		auto &catalog = db.GetCatalog();
-		if (catalog.GetCatalogType() != "odbc") {
+		if (catalog.GetCatalogType() != "sqlserver") {
 			continue;
 		}
 		catalog.Cast<ODBCCatalog>().ClearCache();
@@ -47,6 +47,6 @@ void ODBCClearCacheFunction::ClearCacheOnSetting(ClientContext &context, SetScop
 }
 
 ODBCClearCacheFunction::ODBCClearCacheFunction()
-    : TableFunction("odbc_clear_cache", {}, ClearCacheFunction, ClearCacheBind) {
+    : TableFunction("sqlserver_clear_cache", {}, ClearCacheFunction, ClearCacheBind) {
 }
 } // namespace duckdb

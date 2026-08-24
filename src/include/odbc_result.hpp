@@ -18,7 +18,9 @@ struct OwnedODBCConnection;
 
 struct ODBCField {
 	string name;
-	SQLSMALLINT odbc_type;
+	string type_name;
+	SQLSMALLINT odbc_type = SQL_UNKNOWN_TYPE;
+	SQLSMALLINT c_type = SQL_C_CHAR;
 	LogicalType duckdb_type;
 
 	vector<char> bind_buffer;
@@ -38,8 +40,8 @@ struct ODBCBind {
 
 class ODBCResult {
 public:
-	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
-	           idx_t affected_rows_p, SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p,
+	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p, idx_t affected_rows_p,
+	           SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p,
 	           ODBCResultStreaming streaming_p = ODBCResultStreaming::FORCE_MATERIALIZATION);
 	~ODBCResult();
 

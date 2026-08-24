@@ -80,9 +80,4 @@ public:
 	static void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter);
 };
 
-class ODBCExecuteFunction : public TableFunction {
-public:
-	ODBCExecuteFunction();
-};
-
 } // namespace duckdb

@@ -16,40 +16,37 @@
 namespace duckdb {
 
 ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, string attach_path_p,
-                           AccessMode access_mode)
+                         string default_schema_p, AccessMode access_mode)
     : Catalog(db_p), connection_string(std::move(connection_string_p)), attach_path(std::move(attach_path_p)),
-      access_mode(access_mode), schemas(*this), connection_pool(*this) {
+      access_mode(access_mode), schemas(*this), default_schema(std::move(default_schema_p)), connection_pool(*this) {
 	ODBCConnectionParameters connection_params;
 	unordered_set<string> unused_params;
 	std::tie(connection_params, unused_params) = ODBCUtils::ParseConnectionParameters(connection_string);
-	default_schema = connection_params.database;
+	StringUtil::Trim(default_schema);
 	Value connection_limit;
 	auto &db_instance = db_p.GetDatabase();
-	if (db_instance.TryGetCurrentSetting("odbc_connection_limit", connection_limit)) {
+	if (db_instance.TryGetCurrentSetting("sqlserver_connection_limit", connection_limit)) {
 		connection_pool.SetMaximumConnections(UBigIntValue::Get(connection_limit));
 	}
 	// try to connect
 	ODBCTypeConfig type_config; // 使用默认构造函数
 	auto connection = ODBCConnection::Open(type_config, connection_string);
-	// 连接创建成功，但这里不需要存储它，因为每个事务会创建自己的连接
+	if (default_schema.empty()) {
+		try {
+			auto result = connection->Query("SELECT SCHEMA_NAME()", ODBCResultStreaming::FORCE_MATERIALIZATION);
+			if (result->Next() && !result->IsNull(0)) {
+				default_schema = result->GetString(0);
+				StringUtil::Trim(default_schema);
+			}
+		} catch (...) {
+		}
+	}
+	if (default_schema.empty()) {
+		default_schema = "dbo";
+	}
 }
 
 ODBCCatalog::~ODBCCatalog() = default;
-
-string EscapeConnectionString(const string &input) {
-	string result = "\"";
-	for (auto c : input) {
-		if (c == '\\') {
-			result += "\\\\";
-		} else if (c == '"') {
-			result += "\\\"";
-		} else {
-			result += c;
-		}
-	}
-	result += "\"";
-	return result;
-}
 
 string AddConnectionOption(const KeyValueSecret &kv_secret, const string &name,
                            const unordered_set<string> &existing_params) {
@@ -62,11 +59,11 @@ string AddConnectionOption(const KeyValueSecret &kv_secret, const string &name,
 		// not provided
 		return string();
 	}
-	string result;
-	result += name;
-	result += "=";
-	result += EscapeConnectionString(input_val.ToString());
-	result += " ";
+	string result = name + "={";
+	for (auto ch : input_val.ToString()) {
+		result += ch == '}' ? "}}" : string(1, ch);
+	}
+	result += "};";
 	return result;
 }
 
@@ -165,14 +162,14 @@ vector<string> GetAttributeNames(const vector<URIToken> &tokens, idx_t token_cou
 	vector<string> result;
 	if (token_count == 1) {
 		// only one token - always the host
-		result.emplace_back("host");
+		result.emplace_back("server");
 		return result;
 	}
 	idx_t current_pos = 0;
 	if (tokens[0].delimiter == '@') {
 		// user@...
-		result.emplace_back("user");
-		result.emplace_back("host");
+		result.emplace_back("uid");
+		result.emplace_back("server");
 		current_pos = 1;
 	} else if (tokens[1].delimiter == '@') {
 		// user:password@
@@ -181,13 +178,13 @@ vector<string> GetAttributeNames(const vector<URIToken> &tokens, idx_t token_cou
 			return result;
 		}
 		D_ASSERT(token_count > 2);
-		result.emplace_back("user");
+		result.emplace_back("uid");
 		result.emplace_back("pwd");
-		result.emplace_back("host");
+		result.emplace_back("server");
 		current_pos = 2;
 	} else {
 		// neither user nor password - this MUST be the host
-		result.emplace_back("host");
+		result.emplace_back("server");
 		current_pos = 0;
 	}
 	if (current_pos + 1 == token_count) {
@@ -323,12 +320,12 @@ bool TryConvertURIInternal(const string &dsn, idx_t start_pos, string &connectio
 
 		added_params.insert(val.name);
 
-		if (!connection_string.empty()) {
-			connection_string += " ";
-		}
 		connection_string += val.name;
-		connection_string += "=";
-		connection_string += EscapeConnectionString(val.value);
+		connection_string += "={";
+		for (auto ch : val.value) {
+			connection_string += ch == '}' ? "}}" : string(1, ch);
+		}
+		connection_string += "};";
 	}
 
 	return true;
@@ -342,11 +339,9 @@ void TryConvertURI(string &dsn) {
 
 	// [scheme://][user[:[password]]@]host[:port][/schema][?attribute1=value1&attribute2=value2...
 	idx_t start_pos = 0;
-	// skip the past the scheme (either odbc:// or odbcx://)
-	if (StringUtil::StartsWith(dsn, "odbc://")) {
-		start_pos = 8;
-	} else if (StringUtil::StartsWith(dsn, "odbcx://")) {
-		start_pos = 9;
+	// Skip past the sqlserver:// scheme.
+	if (StringUtil::StartsWith(dsn, "sqlserver://")) {
+		start_pos = 12;
 	} else {
 		return;
 	}
@@ -362,7 +357,7 @@ void TryConvertURI(string &dsn) {
 
 	// not a URI
 	if (start_pos > 0) {
-		// but it started with odbc:// or odbcx:// - throw an error
+		// It used the SQL Server URI scheme, so surface the parse error.
 		error.Throw();
 	}
 }
@@ -374,7 +369,7 @@ string ODBCCatalog::GetConnectionString(ClientContext &context, const string &at
 	if (!explicit_secret) {
 		// look up settings from the default unnamed odbc secret if none is
 		// provided
-		secret_name = "__default_odbc";
+		secret_name = "__default_sqlserver";
 	}
 
 	auto secret_entry = GetSecret(context, secret_name);
@@ -409,7 +404,7 @@ string ODBCCatalog::GetConnectionString(ClientContext &context, const string &at
 		if (!new_connection_info.empty()) {
 			if (!connection_string.empty()) {
 				// Only add a space if both parts are non-empty
-				connection_string = new_connection_info + " " + connection_string;
+				connection_string = new_connection_info + connection_string;
 			} else {
 				connection_string = new_connection_info;
 			}
@@ -425,19 +420,11 @@ void ODBCCatalog::Initialize(bool load_builtin) {
 }
 
 optional_ptr<CatalogEntry> ODBCCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
-		DropInfo try_drop;
-		try_drop.type = CatalogType::SCHEMA_ENTRY;
-		try_drop.name = info.schema;
-		try_drop.if_not_found = OnEntryNotFound::RETURN_NULL;
-		try_drop.cascade = false;
-		schemas.DropEntry(transaction.GetContext(), try_drop);
-	}
-	return schemas.CreateSchema(transaction.GetContext(), info);
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 void ODBCCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	return schemas.DropEntry(context, info);
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 void ODBCCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
@@ -445,8 +432,8 @@ void ODBCCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaC
 }
 
 optional_ptr<SchemaCatalogEntry> ODBCCatalog::LookupSchema(CatalogTransaction transaction,
-                                                            const EntryLookupInfo &schema_lookup,
-                                                            OnEntryNotFound if_not_found) {
+                                                           const EntryLookupInfo &schema_lookup,
+                                                           OnEntryNotFound if_not_found) {
 	auto schema_name = schema_lookup.GetEntryName();
 	if (schema_name == DEFAULT_SCHEMA) {
 		if (default_schema.empty()) {
@@ -471,11 +458,11 @@ string ODBCCatalog::GetDBPath() {
 }
 
 bool ODBCCatalog::IsODBCScan(const string &name) {
-	return name == "odbc_scan";
+	return name == "sqlserver_scan";
 }
 
 bool ODBCCatalog::IsODBCQuery(const string &name) {
-	return name == "odbc_query";
+	return name == "sqlserver_query";
 }
 
 void ODBCCatalog::MaterializeODBCScans(PhysicalOperator &op) {
@@ -496,33 +483,43 @@ void ODBCCatalog::MaterializeODBCScans(PhysicalOperator &op) {
 }
 
 DatabaseSize ODBCCatalog::GetDatabaseSize(ClientContext &context) {
-	if (default_schema.empty()) {
-		throw InvalidInputException("Attempting to fetch the database size - but no database was provided "
-		                            "in the connection string");
-	}
-	auto &postgres_transaction = ODBCTransaction::Get(context, *this);
-	auto query = StringUtil::Replace(R"(
-SELECT SUM(data_length + index_length)
-FROM information_schema.tables
-WHERE table_schema = ${SCHEMA_NAME};
-)",
-	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(default_schema));
-	auto result = postgres_transaction.Query(query);
 	DatabaseSize size;
 	size.free_blocks = 0;
 	size.total_blocks = 0;
 	size.used_blocks = 0;
 	size.wal_size = 0;
 	size.block_size = 0;
-	if (!result->Next()) {
-		throw InternalException("ODBCCatalog::GetDatabaseSize - No row returned!?");
-	}
-	size.bytes = result->IsNull(0) ? 0 : result->GetInt64(0);
+	size.bytes = 0;
 	return size;
 }
 
 void ODBCCatalog::ClearCache() {
 	schemas.ClearEntries();
+}
+
+PhysicalOperator &ODBCCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                 LogicalCreateTable &op, PhysicalOperator &plan) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
+}
+
+PhysicalOperator &ODBCCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                          optional_ptr<PhysicalOperator> plan) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
+}
+
+PhysicalOperator &ODBCCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+                                          PhysicalOperator &plan) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
+}
+
+PhysicalOperator &ODBCCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                          PhysicalOperator &plan) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
+}
+
+unique_ptr<LogicalOperator> ODBCCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt,
+                                                         TableCatalogEntry &table, unique_ptr<LogicalOperator> plan) {
+	throw PermissionException("sqlserver_scanner catalogs are read-only");
 }
 
 } // namespace duckdb

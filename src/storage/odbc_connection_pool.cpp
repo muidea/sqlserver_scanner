@@ -9,8 +9,7 @@ static std::atomic<bool> odbc_use_connection_cache {true};
 ODBCPoolConnection::ODBCPoolConnection() : pool(nullptr) {
 }
 
-ODBCPoolConnection::ODBCPoolConnection(optional_ptr<ODBCConnectionPool> pool,
-                                       shared_ptr<ODBCConnection> connection_p)
+ODBCPoolConnection::ODBCPoolConnection(optional_ptr<ODBCConnectionPool> pool, shared_ptr<ODBCConnection> connection_p)
     : pool(pool), connection(std::move(connection_p)) {
 }
 

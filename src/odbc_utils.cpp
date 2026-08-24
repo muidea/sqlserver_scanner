@@ -90,7 +90,7 @@ bool ReadOptionFromEnv(const char *env, string &result) {
 
 uint32_t ParsePort(const string &value) {
 	constexpr const static int PORT_MIN = 0;
-	constexpr const static int PORT_MAX = 65353;
+	constexpr const static int PORT_MAX = 65535;
 	int port_val = std::stoi(value);
 	if (port_val < PORT_MIN || port_val > PORT_MAX) {
 		throw InvalidInputException("Invalid port %d - port must be between %d and %d", port_val, PORT_MIN, PORT_MAX);
@@ -225,18 +225,19 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 	while (pos < dsn.size()) {
 		string key;
 		string value;
-		
+
 		// Parse key
 		while (pos < dsn.size() && dsn[pos] != '=' && dsn[pos] != ';') {
 			key += dsn[pos];
 			pos++;
 		}
-		
+
 		if (pos >= dsn.size() || dsn[pos] != '=') {
-			throw InvalidInputException("Invalid connection string \"%s\" - expected key=value pairs separated by semicolons", dsn);
+			throw InvalidInputException("Invalid SQL Server connection string - expected key=value pairs separated by "
+			                            "semicolons");
 		}
 		pos++; // skip '='
-		
+
 		// Parse value
 		if (pos < dsn.size() && dsn[pos] == '{') {
 			pos++; // skip '{'
@@ -256,10 +257,11 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 				pos++;
 			}
 			if (!found_closing_brace) {
-				throw InvalidInputException("Invalid connection string \"%s\" - unterminated braced value", dsn);
+				throw InvalidInputException("Invalid SQL Server connection string - unterminated braced value");
 			}
 			if (pos < dsn.size() && dsn[pos] != ';') {
-				throw InvalidInputException("Invalid connection string \"%s\" - expected semicolon after braced value", dsn);
+				throw InvalidInputException(
+				    "Invalid SQL Server connection string - expected semicolon after braced value");
 			}
 		} else {
 			while (pos < dsn.size() && dsn[pos] != ';') {
@@ -267,11 +269,11 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 				pos++;
 			}
 		}
-		
+
 		if (pos < dsn.size() && dsn[pos] == ';') {
 			pos++; // skip ';'
 		}
-		
+
 		auto original_key = key;
 		key = StringUtil::Lower(key);
 
@@ -306,7 +308,7 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 			continue;
 		}
 	}
-	
+
 	// For ODBC, connection parameters are specified in the connection string
 	return std::make_tuple(result, set_options);
 }
@@ -343,15 +345,19 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 			connection_string += extra + ";";
 			continue;
 		}
-		connection_string += extra.substr(0, separator + 1) + EscapeODBCConnectionValue(extra.substr(separator + 1)) + ";";
+		connection_string +=
+		    extra.substr(0, separator + 1) + EscapeODBCConnectionValue(extra.substr(separator + 1)) + ";";
 	}
 
 #ifndef _WIN32
-	if (StringUtil::Lower(connection_string).find("clientcharset") == string::npos) {
-		connection_string += "ClientCharset=UTF-8;";
-	}
-	if (StringUtil::Lower(connection_string).find("tds_version") == string::npos) {
-		connection_string += "TDS_Version=8.0;";
+	auto lower_driver = StringUtil::Lower(config.driver);
+	if (StringUtil::Contains(lower_driver, "freetds")) {
+		if (StringUtil::Lower(connection_string).find("clientcharset") == string::npos) {
+			connection_string += "ClientCharset=UTF-8;";
+		}
+		if (StringUtil::Lower(connection_string).find("tds_version") == string::npos) {
+			connection_string += "TDS_Version=8.0;";
+		}
 	}
 #endif
 
@@ -410,8 +416,7 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 		SQLFreeHandle(SQL_HANDLE_ENV, env);
 
-		throw IOException("Failed to connect to ODBC database with parameters \"%s\": %s", dsn.c_str(),
-		                  (char *)message_text);
+		throw IOException("Failed to connect to SQL Server through ODBC: %s", (char *)message_text);
 	}
 
 	out_env = env;
@@ -422,22 +427,7 @@ string ODBCUtils::EscapeQuotes(const string &text, char quote) {
 	string result;
 	for (auto c : text) {
 		if (c == quote) {
-#ifdef _WIN32
-			// SQL Server on Windows: use double quotes (e.g., 'it''s')
 			result += string(2, quote);
-#else
-			// FreeTDS on Linux: use backslash escape (e.g., 'it\'s')
-			result += "\\";
-			result += quote;
-#endif
-		} else if (c == '\\') {
-#ifndef _WIN32
-			// Only escape backslash on Linux
-			result += "\\\\";
-#else
-			// On Windows, keep backslash as-is
-			result += c;
-#endif
 		} else {
 			result += c;
 		}
@@ -446,10 +436,6 @@ string ODBCUtils::EscapeQuotes(const string &text, char quote) {
 }
 
 string ODBCUtils::WriteQuoted(const string &text, char quote) {
-	// 1. Escapes all occurrences of 'quote' 
-	//    - Windows/SQL Server: by doubling them
-	//    - Linux/FreeTDS: by backslash escaping
-	// 2. Adds quotes around the string
 	return string(1, quote) + EscapeQuotes(text, quote) + string(1, quote);
 }
 
@@ -470,13 +456,12 @@ string ODBCUtils::WriteLiteral(const string &identifier) {
 static string TransformBlobToODBC(const string &val) {
 	char const HEX_DIGITS[] = "0123456789ABCDEF";
 
-	string result = "x'";
+	string result = "0x";
 	for (idx_t i = 0; i < val.size(); i++) {
 		uint8_t byte_val = static_cast<uint8_t>(val[i]);
 		result += HEX_DIGITS[(byte_val >> 4) & 0xf];
 		result += HEX_DIGITS[byte_val & 0xf];
 	}
-	result += "'";
 	return result;
 }
 

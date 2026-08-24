@@ -1,0 +1,56 @@
+# name: test/sql/sqlserver_scanner.test
+# description: SQL Server scanner registration, secrets, and read-only boundary
+# group: [sql]
+
+statement ok
+LOAD 'build/release/extension/sqlserver_scanner/sqlserver_scanner.duckdb_extension';
+
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE function_name IN ('sqlserver_clear_cache', 'sqlserver_metadata', 'sqlserver_query')
+ORDER BY function_name;
+----
+sqlserver_clear_cache
+sqlserver_metadata
+sqlserver_query
+
+statement ok
+CREATE TEMPORARY SECRET sqlserver_scanner_test_secret (
+    TYPE sqlserver,
+    DRIVER 'FreeTDS',
+    SERVER 'sqlserver.example',
+    PORT '1433',
+    DATABASE 'master',
+    UID 'app',
+    PWD 'do_not_expose'
+);
+
+query TT
+SELECT name, type
+FROM duckdb_secrets()
+WHERE name = 'sqlserver_scanner_test_secret';
+----
+sqlserver_scanner_test_secret	sqlserver
+
+query I
+SELECT count(*)
+FROM duckdb_secrets()
+WHERE name = 'sqlserver_scanner_test_secret'
+  AND secret_string NOT LIKE '%do_not_expose%'
+  AND secret_string LIKE '%pwd=redacted%';
+----
+1
+
+statement error
+ATTACH 'Driver={missing};Server=invalid;UID=u;PWD=do_not_expose;' AS sqlserver_rw (TYPE sqlserver_scanner);
+----
+sqlserver_scanner is read-only
+
+statement error
+ATTACH 'Driver={missing};Server=invalid;UID=u;PWD=do_not_expose;' AS sqlserver_missing_driver (
+    TYPE sqlserver_scanner,
+    READ_ONLY
+);
+----
+Failed to connect to SQL Server through ODBC

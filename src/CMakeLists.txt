@@ -5,8 +5,7 @@ add_subdirectory(storage)
 add_library(
   odbc_ext_library OBJECT
   odbc_connection.cpp
-  odbc_execute.cpp
-  odbc_extension.cpp
+  sqlserver_extension.cpp
   odbc_filter_pushdown.cpp
   odbc_metadata.cpp
   odbc_parameter.cpp
