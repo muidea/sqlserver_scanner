@@ -8,12 +8,18 @@ LOAD 'build/release/extension/sqlserver_scanner/sqlserver_scanner.duckdb_extensi
 query T
 SELECT function_name
 FROM duckdb_functions()
-WHERE function_name IN ('sqlserver_clear_cache', 'sqlserver_metadata', 'sqlserver_query')
+WHERE function_name IN ('sqlserver_clear_cache', 'sqlserver_metadata', 'sqlserver_query', 'sqlserver_relational_metadata')
 ORDER BY function_name;
 ----
 sqlserver_clear_cache
 sqlserver_metadata
 sqlserver_query
+sqlserver_relational_metadata
+
+statement error
+SELECT * FROM sqlserver_relational_metadata('catalog', 'indexes', 'dbo', 'unexpected');
+----
+sqlserver_relational_metadata expects catalog, category, and optional schema
 
 statement ok
 CREATE TEMPORARY SECRET sqlserver_scanner_test_secret (

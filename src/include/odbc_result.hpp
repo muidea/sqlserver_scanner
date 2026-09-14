@@ -24,6 +24,10 @@ struct ODBCField {
 	LogicalType duckdb_type;
 
 	vector<char> bind_buffer;
+	// SQLBindCol retains bind_buffer.data() for the cursor lifetime. Truncated
+	// variable-width values are completed separately so that address is stable.
+	vector<char> value_buffer;
+	bool column_bound = true;
 	SQLLEN bind_length = 0;
 	bool bind_is_null = false;
 	bool bind_error = false;
@@ -31,6 +35,8 @@ struct ODBCField {
 	ODBCField(void *field_info, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config);
 
 	void ResetBind();
+	const char *ValueData() const;
+	size_t ValueBufferSize() const;
 };
 
 struct ODBCBind {
@@ -68,6 +74,7 @@ private:
 	vector<SQLSMALLINT> bind_types;
 
 	DataChunk data_chunk;
+	DataChunk *current_row_chunk = nullptr;
 	idx_t row_idx = static_cast<idx_t>(-1);
 	bool connection_released = false;
 
@@ -80,10 +87,11 @@ private:
 
 	bool FetchNext();
 	void HandleTruncatedData();
-	void WriteToChunk(idx_t row);
+	void WriteToChunk(DataChunk &chunk, idx_t row);
 	void CheckColumnIdx(idx_t col);
 	void CheckNotNull(idx_t col);
 	void CheckType(idx_t col, LogicalTypeId type_id);
+	DataChunk &CurrentRowChunk();
 
 	// Materialized mode: read all data into cached_chunks
 	void ReadAllData();

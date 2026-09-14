@@ -76,7 +76,8 @@ shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, cons
 	return make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
 }
 
-idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming) {
+idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming,
+                                  uint32_t timeout_seconds) {
 	if (ODBCConnection::DebugPrintQueries()) {
 		Printer::Print(query + "\n");
 	}
@@ -114,7 +115,23 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	// 对于预编译语句接口，调用者负责清理语句句柄
 	// 我们只需要确保在失败时抛出适当的异常
 
-	retcode = SQLPrepareWithFallback(stmt, query);
+	if (timeout_seconds > 0) {
+		retcode = SQLSetStmtAttr(stmt, SQL_ATTR_QUERY_TIMEOUT,
+		                         reinterpret_cast<SQLPOINTER>(static_cast<uintptr_t>(timeout_seconds)), 0);
+		if (!SQL_SUCCEEDED(retcode)) {
+			throw IOException("Failed to set ODBC query timeout for query \"%s\"\n", query.c_str());
+		}
+	}
+
+	// FreeTDS has a cursor-state bug for prepared statements that return
+	// several variable-width columns (the next execution can expose values
+	// from a different column). Queries without parameters do not need the
+	// prepare path, so execute them directly on the same statement handle.
+	if (params.empty()) {
+		retcode = SQLExecDirectWithFallback(stmt, query);
+	} else {
+		retcode = SQLPrepareWithFallback(stmt, query);
+	}
 	if (!SQL_SUCCEEDED(retcode)) {
 		// 获取详细的ODBC错误信息
 		SQLCHAR sqlstate[6] = {0};
@@ -131,6 +148,19 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 
 	vector<ODBCParameter> odbc_params;
+	if (params.empty()) {
+		SQLLEN affected_rows = 0;
+		retcode = SQLRowCount(stmt, &affected_rows);
+		if (!SQL_SUCCEEDED(retcode)) {
+			affected_rows = -1;
+		}
+		SQLSMALLINT num_cols = 0;
+		SQLRETURN col_ret = SQLNumResultCols(stmt, &num_cols);
+		if (SQL_SUCCEEDED(col_ret) && num_cols > 0) {
+			affected_rows = -1;
+		}
+		return affected_rows >= 0 ? static_cast<idx_t>(affected_rows) : static_cast<idx_t>(-1);
+	}
 	if (params.size() > 0) {
 		SQLSMALLINT param_count;
 		retcode = SQLNumParams(stmt, &param_count);
@@ -209,7 +239,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 
 unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector<Value> params,
                                                      ODBCResultStreaming streaming,
-                                                     ODBCConnectorInterface con_interface) {
+                                                     ODBCConnectorInterface con_interface, uint32_t timeout_seconds) {
 
 	// 检查连接是否繁忙
 	bool expected = false;
@@ -250,7 +280,12 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	bool basic_interface = con_interface == ODBCConnectorInterface::BASIC;
 
 	if (basic_interface) {
-		ODBCExecute(nullptr, query, params, result_streaming);
+		try {
+			ODBCExecute(nullptr, query, params, result_streaming, timeout_seconds);
+		} catch (...) {
+			ReleaseConnection();
+			throw;
+		}
 		// BASIC接口不创建ODBCResult，需要立即释放连接忙状态
 		ReleaseConnection();
 		return unique_ptr<ODBCResult>(nullptr);
@@ -266,7 +301,7 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 
 	idx_t affected_rows = 0;
 	try {
-		affected_rows = ODBCExecute(hstmt, query, params, result_streaming);
+		affected_rows = ODBCExecute(hstmt, query, params, result_streaming, timeout_seconds);
 	} catch (const std::exception &) {
 		// 执行失败，清理语句句柄
 		if (hstmt != SQL_NULL_HSTMT) {
@@ -295,10 +330,8 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 		                                    affected_rows, num_cols, shared_from_this(), streaming);
 		return result;
 	} catch (const std::exception &e) {
-		// ODBCResult构造函数失败，清理语句句柄
-		if (hstmt != SQL_NULL_HSTMT) {
-			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-		}
+		// ODBCStatementPtr already owns and releases hstmt if construction
+		// fails. Freeing the raw handle here would be a double free.
 		// 释放连接忙状态
 		ReleaseConnection();
 		throw IOException("Failed to create ODBC result for query \"%s\": %s\n", query.c_str(), e.what());
@@ -311,6 +344,15 @@ unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, ODBCResultStre
 
 unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, vector<Value> params, ODBCResultStreaming streaming) {
 	return QueryInternal(query, params, streaming, ODBCConnectorInterface::PREPARED_STATEMENT);
+}
+
+unique_ptr<ODBCResult> ODBCConnection::QueryWithTimeout(const string &query, ODBCResultStreaming streaming,
+                                                        uint32_t timeout_seconds) {
+	if (timeout_seconds == 0) {
+		throw InvalidInputException("ODBC query timeout must be greater than zero");
+	}
+	return QueryInternal(query, vector<Value>(), streaming, ODBCConnectorInterface::PREPARED_STATEMENT,
+	                     timeout_seconds);
 }
 
 void ODBCConnection::Execute(const string &query) {

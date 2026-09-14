@@ -22,6 +22,7 @@ namespace duckdb {
 
 static const size_t DEFAULT_BIND_BUFFER_SIZE = 64;
 static const size_t MAX_BIND_BUFFER_SIZE = 65536;
+static const size_t MAX_VALUE_SIZE = MAX_BIND_BUFFER_SIZE * 16;
 
 static string UTF16UnitsToUTF8(const SQLWCHAR *data, size_t code_units) {
 	if (!data || code_units == 0) {
@@ -62,21 +63,32 @@ static size_t GetBufferSize(SQLSMALLINT c_type, SQLULEN column_size) {
 	case SQL_C_TYPE_TIMESTAMP:
 		return sizeof(SQL_TIMESTAMP_STRUCT);
 	case SQL_C_WCHAR:
-		if (column_size > 0 && column_size <= MAX_BIND_BUFFER_SIZE / sizeof(SQLWCHAR)) {
+		if (column_size > 0 && column_size <= MAX_VALUE_SIZE / sizeof(SQLWCHAR)) {
 			return static_cast<size_t>((column_size + 1) * sizeof(SQLWCHAR));
 		}
-		return DEFAULT_BIND_BUFFER_SIZE * sizeof(SQLWCHAR);
+		return MAX_VALUE_SIZE + sizeof(SQLWCHAR);
 	case SQL_C_CHAR:
-		if (column_size > 0 && column_size <= MAX_BIND_BUFFER_SIZE) {
+		if (column_size > 0 && column_size <= MAX_VALUE_SIZE) {
 			return static_cast<size_t>(column_size + 1);
 		}
-		return DEFAULT_BIND_BUFFER_SIZE;
+		return MAX_VALUE_SIZE + 1;
 	default:
-		if (column_size > 0 && column_size <= MAX_BIND_BUFFER_SIZE) {
+		if (column_size > 0 && column_size <= MAX_VALUE_SIZE) {
 			return static_cast<size_t>(column_size);
 		}
-		return DEFAULT_BIND_BUFFER_SIZE;
+		return MAX_VALUE_SIZE;
 	}
+}
+
+static size_t GetBoundPayloadCapacity(const ODBCField &field) {
+	auto capacity = field.bind_buffer.size();
+	if (field.c_type == SQL_C_CHAR && capacity > 0) {
+		return capacity - 1;
+	}
+	if (field.c_type == SQL_C_WCHAR && capacity >= sizeof(SQLWCHAR)) {
+		return capacity - sizeof(SQLWCHAR);
+	}
+	return capacity;
 }
 
 ODBCField::ODBCField(void *field_info, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config)
@@ -90,6 +102,15 @@ void ODBCField::ResetBind() {
 	this->bind_is_null = false;
 	this->bind_length = 0;
 	this->bind_error = false;
+	this->value_buffer.clear();
+}
+
+const char *ODBCField::ValueData() const {
+	return value_buffer.empty() ? bind_buffer.data() : value_buffer.data();
+}
+
+size_t ODBCField::ValueBufferSize() const {
+	return value_buffer.empty() ? bind_buffer.size() : value_buffer.size();
 }
 
 static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, const ODBCTypeConfig &type_config) {
@@ -161,12 +182,81 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 static void InitBinds(vector<ODBCField> &fields, SQLHSTMT stmt) {
 	for (SQLSMALLINT i = 0; i < fields.size(); i++) {
 		ODBCField &f = fields[i];
-
 		SQLRETURN retcode =
 		    SQLBindCol(stmt, i + 1, f.c_type, f.bind_buffer.data(), f.bind_buffer.size(), &f.bind_length);
 
 		if (!SQL_SUCCEEDED(retcode)) {
 			throw IOException("Failed to bind column %d for ODBC query\n", i + 1);
+		}
+	}
+}
+
+static size_t TextPayloadLength(const vector<char> &buffer, SQLSMALLINT c_type) {
+	if (c_type == SQL_C_CHAR) {
+		return strnlen(buffer.data(), buffer.size());
+	}
+	if (c_type == SQL_C_WCHAR) {
+		auto units = buffer.size() / sizeof(SQLWCHAR);
+		auto data = reinterpret_cast<const SQLWCHAR *>(buffer.data());
+		idx_t offset = 0;
+		while (offset < units && data[offset] != 0) {
+			offset++;
+		}
+		return offset * sizeof(SQLWCHAR);
+	}
+	return 0;
+}
+
+static void ReadUnboundVariableData(vector<ODBCField> &fields, SQLHSTMT stmt, const string &query) {
+	static constexpr size_t CHUNK_SIZE = 8192;
+	static constexpr size_t MAX_VALUE_SIZE = MAX_BIND_BUFFER_SIZE * 16;
+	vector<char> buffer(CHUNK_SIZE);
+	for (idx_t i = 0; i < fields.size(); i++) {
+		auto &field = fields[i];
+		if (field.column_bound) {
+			continue;
+		}
+		field.value_buffer.clear();
+		while (true) {
+			memset(buffer.data(), 0, buffer.size());
+			SQLLEN indicator = 0;
+			auto retcode = SQLGetData(stmt, static_cast<SQLUSMALLINT>(i + 1), field.c_type, buffer.data(),
+			                          static_cast<SQLLEN>(buffer.size()), &indicator);
+			if (indicator == SQL_NULL_DATA) {
+				field.bind_length = SQL_NULL_DATA;
+				field.value_buffer.clear();
+				break;
+			}
+			if (retcode == SQL_NO_DATA) {
+				break;
+			}
+			if (!SQL_SUCCEEDED(retcode)) {
+				throw IOException("Failed to read variable-width column %zu for ODBC query \"%s\"", i + 1,
+				                  query.c_str());
+			}
+			size_t payload = 0;
+			if (field.c_type == SQL_C_BINARY) {
+				payload = retcode == SQL_SUCCESS_WITH_INFO
+				              ? buffer.size()
+				              : MinValue<size_t>(indicator < 0 ? 0 : static_cast<size_t>(indicator), buffer.size());
+			} else {
+				payload = TextPayloadLength(buffer, field.c_type);
+			}
+			if (field.value_buffer.size() + payload > MAX_VALUE_SIZE) {
+				throw IOException("Variable-width column %zu exceeds the %zu byte ODBC safety limit for query \"%s\"",
+				                  i + 1, MAX_VALUE_SIZE, query.c_str());
+			}
+			field.value_buffer.insert(field.value_buffer.end(), buffer.data(), buffer.data() + payload);
+			if (retcode == SQL_SUCCESS) {
+				break;
+			}
+			if (payload == 0) {
+				throw IOException("ODBC driver made no progress reading variable-width column %zu for query \"%s\"",
+				                  i + 1, query.c_str());
+			}
+		}
+		if (field.bind_length != SQL_NULL_DATA) {
+			field.bind_length = static_cast<SQLLEN>(field.value_buffer.size());
 		}
 	}
 }
@@ -195,6 +285,7 @@ ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBC
 	}
 
 	if (affected_rows != static_cast<idx_t>(-1)) {
+		stmt.reset();
 		if (connection && !connection_released) {
 			connection->ReleaseConnection();
 			connection_released = true;
@@ -224,12 +315,17 @@ ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBC
 		}
 
 		if (!is_streaming) {
+			// Do not make the connection reusable while a completed result still
+			// owns a driver statement. The rows are now DuckDB-owned, so release
+			// the statement first while QueryInternal still holds query_lock.
+			stmt.reset();
 			if (connection && !connection_released) {
 				connection->ReleaseConnection();
 				connection_released = true;
 			}
 		}
 	} catch (const std::exception &) {
+		stmt.reset();
 		if (connection && !connection_released) {
 			connection->ReleaseConnection();
 			connection_released = true;
@@ -247,10 +343,6 @@ void ODBCResult::ReadAllData() {
 		return;
 	}
 
-	// 保存原始的data_chunk状态
-	DataChunk original_chunk;
-	original_chunk.Initialize(Allocator::DefaultAllocator(), data_chunk.GetTypes());
-
 	// 循环读取所有数据，直到没有更多行
 	while (true) {
 		// 创建一个新的数据块
@@ -258,23 +350,16 @@ void ODBCResult::ReadAllData() {
 		auto ltypes = CreateChunkTypes(fields, type_config);
 		chunk->Initialize(Allocator::DefaultAllocator(), ltypes);
 
-		// 临时设置data_chunk指向当前chunk，以便WriteToChunk正确写入
-		data_chunk.Reference(*chunk);
-
 		idx_t r = 0;
 		for (; r < STANDARD_VECTOR_SIZE; r++) {
 			if (!FetchNext()) {
 				break;
 			}
 
-			WriteToChunk(r);
+			WriteToChunk(*chunk, r);
 		}
 
-		// 恢复原始的data_chunk
-		data_chunk.Reference(original_chunk);
-
 		if (r == 0) {
-			// 没有读取到任何数据，结束循环
 			break;
 		}
 
@@ -308,18 +393,25 @@ ODBCResult::~ODBCResult() {
 void ODBCResult::HandleTruncatedData() {
 	for (size_t i = 0; i < fields.size(); i++) {
 		ODBCField &f = fields[i];
+		if (!f.column_bound) {
+			continue;
+		}
 
 		if (f.bind_length == SQL_NULL_DATA) {
 			continue;
 		}
 
+		auto bound_payload_capacity = GetBoundPayloadCapacity(f);
 		bool truncated = (f.bind_length == SQL_NO_TOTAL) ||
-		                 (f.bind_length > 0 && static_cast<size_t>(f.bind_length) > f.bind_buffer.size());
+		                 (f.bind_length > 0 && static_cast<size_t>(f.bind_length) > bound_payload_capacity);
 		if (!truncated) {
 			continue;
 		}
+		throw IOException("ODBC column %zu exceeds the %zu byte safety limit for query \"%s\"", i + 1, MAX_VALUE_SIZE,
+		                  query.c_str());
 
 		SQLSMALLINT c_type = f.c_type;
+		SQLLEN original_length = f.bind_length;
 
 		// Determine the full data length; double the buffer when length is unknown
 		size_t total_len;
@@ -337,26 +429,28 @@ void ODBCResult::HandleTruncatedData() {
 		// For character data, retrieve remaining bytes via SQLGetData.
 		// The bind buffer already contains the first portion (before truncation).
 		if (c_type == SQL_C_CHAR || c_type == SQL_C_BINARY || c_type == SQL_C_WCHAR) {
-			size_t already_have = f.bind_buffer.size();
-			if (c_type == SQL_C_CHAR && already_have > 0) {
-				already_have--;
-			} else if (c_type == SQL_C_WCHAR && already_have >= sizeof(SQLWCHAR)) {
-				already_have -= sizeof(SQLWCHAR);
-			}
-
-			size_t resize_target = total_len + 1;
+			size_t already_have = bound_payload_capacity;
+			size_t terminator_size = c_type == SQL_C_CHAR ? 1 : 0;
 			if (c_type == SQL_C_WCHAR) {
-				resize_target = total_len + sizeof(SQLWCHAR);
+				terminator_size = sizeof(SQLWCHAR);
 			}
-			f.bind_buffer.resize(resize_target);
+			f.value_buffer.resize(total_len + terminator_size);
+			if (already_have > 0) {
+				memcpy(f.value_buffer.data(), f.bind_buffer.data(), already_have);
+			}
 
 			SQLLEN remaining_len = 0;
 			SQLRETURN retcode =
-			    SQLGetData(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.bind_buffer.data() + already_have,
-			               static_cast<SQLLEN>(f.bind_buffer.size() - already_have), &remaining_len);
+			    SQLGetData(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.value_buffer.data() + already_have,
+			               static_cast<SQLLEN>(f.value_buffer.size() - already_have), &remaining_len);
 
-			if (SQL_SUCCEEDED(retcode) && remaining_len >= 0) {
-				f.bind_length = static_cast<SQLLEN>(already_have) + remaining_len;
+			if (SQL_SUCCEEDED(retcode) && original_length > 0) {
+				f.bind_length = MinValue<SQLLEN>(original_length, static_cast<SQLLEN>(total_len));
+			} else if (SQL_SUCCEEDED(retcode) && remaining_len >= 0) {
+				f.bind_length =
+				    MinValue<SQLLEN>(static_cast<SQLLEN>(already_have) + remaining_len, static_cast<SQLLEN>(total_len));
+			} else if (retcode == SQL_SUCCESS_WITH_INFO) {
+				f.bind_length = static_cast<SQLLEN>(total_len);
 			} else {
 				// SQLGetData failed; keep what we have, clamp length to buffer
 				f.bind_length = static_cast<SQLLEN>(already_have);
@@ -385,31 +479,30 @@ DataChunk &ODBCResult::NextChunk() {
 				stream_exhausted = true;
 				break;
 			}
-			WriteToChunk(r);
+			WriteToChunk(data_chunk, r);
 		}
 
 		data_chunk.SetCardinality(r);
 
-		if (stream_exhausted && connection && !connection_released) {
-			connection->ReleaseConnection();
-			connection_released = true;
+		if (stream_exhausted) {
+			stmt.reset();
+			if (connection && !connection_released) {
+				connection->ReleaseConnection();
+				connection_released = true;
+			}
 		}
 
 		return data_chunk;
 	}
 
 	// Materialized mode: return from cache
-	if (!cached_chunks.empty()) {
-		if (current_chunk_idx < cached_chunks.size()) {
-			data_chunk.Reference(*cached_chunks[current_chunk_idx]);
-			current_chunk_idx++;
-			return data_chunk;
-		} else {
-			data_chunk.SetCardinality(0);
-			return data_chunk;
-		}
+	if (current_chunk_idx < cached_chunks.size()) {
+		// Return the owned chunk itself. Retargeting data_chunk here can mutate
+		// vectors that are still referenced by a table-function output chunk.
+		return *cached_chunks[current_chunk_idx++];
 	}
 
+	data_chunk.Reset();
 	data_chunk.SetCardinality(0);
 	return data_chunk;
 }
@@ -455,21 +548,27 @@ bool ODBCResult::FetchNext() {
 }
 
 bool ODBCResult::Next() {
-	if (row_idx < data_chunk.size() - 1) {
+	if (current_row_chunk && row_idx + 1 < current_row_chunk->size()) {
 		row_idx += 1;
 		return true;
 	}
 
-	NextChunk();
+	auto &chunk = NextChunk();
+	current_row_chunk = &chunk;
 	row_idx = 0;
-	bool result = data_chunk.size() > 0;
+	bool result = chunk.size() > 0;
 	return result;
 }
 
+DataChunk &ODBCResult::CurrentRowChunk() {
+	return current_row_chunk ? *current_row_chunk : data_chunk;
+}
+
 void ODBCResult::CheckColumnIdx(idx_t col) {
-	if (col >= data_chunk.ColumnCount()) {
-		throw IOException("Column: %zu out of range of field count: %zu, ODBC query \"%s\"\n", col,
-		                  data_chunk.ColumnCount(), query.c_str());
+	auto &chunk = CurrentRowChunk();
+	if (col >= chunk.ColumnCount()) {
+		throw IOException("Column: %zu out of range of field count: %zu, ODBC query \"%s\"\n", col, chunk.ColumnCount(),
+		                  query.c_str());
 	}
 }
 
@@ -483,7 +582,7 @@ string ODBCResult::GetString(idx_t col) {
 	CheckNotNull(col);
 	ODBCField &f = fields[col];
 	if (f.duckdb_type.id() == LogicalTypeId::VARCHAR || f.duckdb_type.id() == LogicalTypeId::BLOB) {
-		Vector &vec = data_chunk.data[col];
+		Vector &vec = CurrentRowChunk().data[col];
 		string_t *data = FlatVector::GetData<string_t>(vec);
 		string_t &st = data[row_idx];
 		return string(st.GetData(), st.GetSize());
@@ -495,7 +594,7 @@ string ODBCResult::GetString(idx_t col) {
 int32_t ODBCResult::GetInt32(idx_t col) {
 	CheckNotNull(col);
 	ODBCField &f = fields[col];
-	Vector &vec = data_chunk.data[col];
+	Vector &vec = CurrentRowChunk().data[col];
 	if (f.duckdb_type.id() == LogicalTypeId::INTEGER) {
 		int32_t *data = FlatVector::GetData<int32_t>(vec);
 		return data[row_idx];
@@ -510,7 +609,7 @@ int32_t ODBCResult::GetInt32(idx_t col) {
 int64_t ODBCResult::GetInt64(idx_t col) {
 	CheckNotNull(col);
 	ODBCField &f = fields[col];
-	Vector &vec = data_chunk.data[col];
+	Vector &vec = CurrentRowChunk().data[col];
 
 	// Handle various integer types that can be converted to int64_t
 	switch (f.duckdb_type.id()) {
@@ -567,7 +666,7 @@ int64_t ODBCResult::GetInt64(idx_t col) {
 
 bool ODBCResult::IsNull(idx_t col) {
 	CheckColumnIdx(col);
-	Vector &vec = data_chunk.data[col];
+	Vector &vec = CurrentRowChunk().data[col];
 	return FlatVector::IsNull(vec, row_idx);
 }
 
@@ -600,12 +699,12 @@ static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
-	if (f.bind_length < 0 || static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
+	if (f.bind_length < 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
 
-	string decimal_str(f.bind_buffer.data(), static_cast<size_t>(f.bind_length));
+	string decimal_str(f.ValueData(), static_cast<size_t>(f.bind_length));
 
 	auto &vec_type = vec.GetType();
 	uint8_t precision = DecimalType::GetWidth(vec_type);
@@ -658,11 +757,11 @@ static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
 }
 
 static void WriteDoubleFromString(ODBCField &f, Vector &vec, idx_t row) {
-	if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
+	if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
-	string value(f.bind_buffer.data(), NumericCast<size_t>(f.bind_length));
+	string value(f.ValueData(), NumericCast<size_t>(f.bind_length));
 	try {
 		FlatVector::GetData<double>(vec)[row] = std::stod(value);
 	} catch (const std::exception &e) {
@@ -678,7 +777,7 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
-	if (f.bind_buffer.empty()) {
+	if (f.ValueBufferSize() == 0) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
@@ -690,16 +789,16 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 
 	SQLSMALLINT c_type = f.c_type;
 	if (c_type == SQL_C_WCHAR) {
-		if (f.bind_length <= 0 || f.bind_buffer.size() < sizeof(SQLWCHAR)) {
+		if (f.bind_length <= 0 || f.ValueBufferSize() < sizeof(SQLWCHAR)) {
 			FlatVector::SetNull(vec, row, true);
 			return;
 		}
 		size_t byte_len = static_cast<size_t>(f.bind_length);
-		if (byte_len > f.bind_buffer.size()) {
-			byte_len = f.bind_buffer.size();
+		if (byte_len > f.ValueBufferSize()) {
+			byte_len = f.ValueBufferSize();
 		}
 		size_t unit_len = byte_len / sizeof(SQLWCHAR);
-		auto *wdata = reinterpret_cast<const SQLWCHAR *>(f.bind_buffer.data());
+		auto *wdata = reinterpret_cast<const SQLWCHAR *>(f.ValueData());
 		while (unit_len > 0 && wdata[unit_len - 1] == 0) {
 			unit_len--;
 		}
@@ -710,11 +809,11 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
-	if (static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
-		f.bind_length = static_cast<SQLLEN>(f.bind_buffer.size());
+	if (static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+		f.bind_length = static_cast<SQLLEN>(f.ValueBufferSize());
 	}
 
-	string_t st(f.bind_buffer.data(), f.bind_length);
+	string_t st(f.ValueData(), f.bind_length);
 	auto data = FlatVector::GetData<string_t>(vec);
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
@@ -819,14 +918,14 @@ static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 	}
 }
 
-void ODBCResult::WriteToChunk(idx_t row) {
-	for (idx_t col = 0; col < data_chunk.ColumnCount(); col++) {
+void ODBCResult::WriteToChunk(DataChunk &chunk, idx_t row) {
+	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 		if (col >= fields.size()) {
 			throw InternalException("Column index out of bounds in WriteToChunk");
 		}
 
 		ODBCField &f = fields[col];
-		Vector &vec = data_chunk.data[col];
+		Vector &vec = chunk.data[col];
 
 		if (f.bind_length == SQL_NULL_DATA) {
 			FlatVector::SetNull(vec, row, true);

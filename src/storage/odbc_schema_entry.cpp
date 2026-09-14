@@ -98,15 +98,7 @@ optional_ptr<CatalogEntry> ODBCSchemaEntry::LookupEntry(CatalogTransaction trans
 	}
 
 	if (lookup_type == CatalogType::TABLE_ENTRY || lookup_type == CatalogType::VIEW_ENTRY) {
-		try {
-			auto refreshed = tables.RefreshTable(context, entry_name);
-			return refreshed;
-		} catch (...) {
-			// If the probe fails (e.g., the table truly does not exist), fall
-			// back to returning nullptr so the binder can report a standard
-			// "table does not exist" error.
-			return nullptr;
-		}
+		return tables.RefreshTable(context, entry_name);
 	}
 
 	return nullptr;
