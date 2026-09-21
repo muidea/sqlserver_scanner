@@ -32,8 +32,21 @@ void ODBCTableSet::LoadEntries(ClientContext &context) {
 	auto &transaction = ODBCTransaction::Get(context, catalog);
 	// Bracket precision/scale: both names are reserved-word-sensitive on
 	// newer parsers, while SQL Server 2000 does not expose sys.objects/sys.columns
-	// at all. Keep a legacy catalog query for that server generation.
-	auto query = StringUtil::Replace(R"(
+	// at all. Select the legacy catalog only from the proven server version;
+	// an arbitrary modern-query error must remain visible instead of silently
+	// changing metadata semantics.
+	auto version_result = transaction.Query("SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(128))");
+	if (!version_result->Next()) {
+		throw InvalidInputException("SQL Server product version query returned no rows");
+	}
+	auto version = version_result->GetString(0);
+	bool legacy;
+	try {
+		legacy = std::stoi(version.substr(0, version.find('.'))) < 9;
+	} catch (...) {
+		throw InvalidInputException("Unable to parse SQL Server product version \"%s\"", version);
+	}
+	auto modern_query = StringUtil::Replace(R"(
 SELECT
     CAST(t.name AS varchar(128)) AS TABLE_NAME,
     CAST(CASE WHEN t.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END AS varchar(32)) AS TABLE_TYPE,
@@ -51,12 +64,8 @@ WHERE s.name = ${SCHEMA_NAME}
   AND t.type IN ('U', 'V')
 ORDER BY t.name, c.column_id
 )",
-	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
-	unique_ptr<ODBCResult> result;
-	try {
-		result = transaction.Query(query);
-	} catch (...) {
-		auto legacy_query = StringUtil::Replace(R"(
+	                                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+	auto legacy_query = StringUtil::Replace(R"(
 SELECT
     CAST(t.name AS varchar(128)) AS TABLE_NAME,
     CAST(CASE WHEN t.xtype = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END AS varchar(32)) AS TABLE_TYPE,
@@ -72,9 +81,8 @@ WHERE t.uid = USER_ID(${SCHEMA_NAME})
   AND t.xtype IN ('U', 'V')
 ORDER BY t.name, c.colid
 )",
-		                                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
-		result = transaction.Query(legacy_query);
-	}
+	                                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+	auto result = transaction.Query(legacy ? legacy_query : modern_query);
 
 	unordered_map<string, unique_ptr<ODBCTableInfo>> table_infos;
 	ODBCTypeConfig type_config(context);
