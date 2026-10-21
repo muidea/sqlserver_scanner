@@ -46,9 +46,9 @@ ODBCConnectionPool::ODBCConnectionPool(ODBCCatalog &odbc_catalog, idx_t maximum_
 }
 
 ODBCPoolConnection ODBCConnectionPool::GetConnectionInternal() {
-	active_connections++;
 	// check if we have any cached connections left
 	if (!connection_cache.empty()) {
+		active_connections++;
 		auto connection = ODBCPoolConnection(this, std::move(connection_cache.back()));
 		connection_cache.pop_back();
 		return connection;
@@ -56,7 +56,9 @@ ODBCPoolConnection ODBCConnectionPool::GetConnectionInternal() {
 
 	// no cached connections left but there is space to open a new one - open it
 	ODBCTypeConfig type_config;
-	return ODBCPoolConnection(this, ODBCConnection::Open(type_config, odbc_catalog.connection_string));
+	auto connection = ODBCConnection::Open(type_config, odbc_catalog.connection_string);
+	active_connections++;
+	return ODBCPoolConnection(this, std::move(connection));
 }
 
 ODBCPoolConnection ODBCConnectionPool::ForceGetConnection() {
@@ -101,7 +103,7 @@ void ODBCConnectionPool::ReturnConnection(shared_ptr<ODBCConnection> connection)
 		// immediately
 		return;
 	}
-	if (!odbc_use_connection_cache.load(std::memory_order_relaxed)) {
+	if (!connection || !connection->IsOpen() || !odbc_use_connection_cache.load(std::memory_order_relaxed)) {
 		return;
 	}
 	// check if the underlying connection is still usable

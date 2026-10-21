@@ -18,17 +18,22 @@ static unique_ptr<Catalog> ODBCAttach(optional_ptr<StorageExtensionInfo> storage
 	// check if we have a secret provided
 	string secret_name;
 	string schema_name;
+	bool guarded_crud_admin = false;
 	for (auto &entry : attach_options.options) {
 		auto lower_name = StringUtil::Lower(entry.first);
 		if (lower_name == "secret") {
 			secret_name = entry.second.ToString();
 		} else if (lower_name == "schema") {
 			schema_name = entry.second.ToString();
+#ifdef SQLSERVER_GUARDED_CRUD
+		} else if (lower_name == "guarded_crud_admin") {
+			guarded_crud_admin = BooleanValue::Get(entry.second);
+#endif
 		} else {
 			throw BinderException("Unrecognized option for SQL Server attach: %s", entry.first);
 		}
 	}
-	if (attach_options.access_mode != AccessMode::READ_ONLY) {
+	if (attach_options.access_mode != AccessMode::READ_ONLY && !guarded_crud_admin) {
 		throw BinderException("sqlserver_scanner is read-only; add READ_ONLY to the ATTACH options");
 	}
 

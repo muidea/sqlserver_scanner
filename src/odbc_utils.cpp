@@ -175,7 +175,7 @@ string CreateTemporaryODBCIni(const ODBCConnectionParameters &config, string &ds
 		WriteODBCIniValue(file, "ClientCharset", "UTF-8");
 	}
 	if (!HasExtraParam(config.extra_params, "TDS_Version")) {
-		WriteODBCIniValue(file, "TDS_Version", "8.0");
+		WriteODBCIniValue(file, "TDS_Version", "auto");
 	}
 
 	file.close();
@@ -356,7 +356,7 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 			connection_string += "ClientCharset=UTF-8;";
 		}
 		if (StringUtil::Lower(connection_string).find("tds_version") == string::npos) {
-			connection_string += "TDS_Version=8.0;";
+			connection_string += "TDS_Version=auto;";
 		}
 	}
 #endif
@@ -384,6 +384,14 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 	if (!SQL_SUCCEEDED(ret)) {
 		SQLFreeHandle(SQL_HANDLE_ENV, env);
 		throw IOException("Failed to allocate ODBC connection handle");
+	}
+
+	// Bound login before a guarded operation can install its statement watcher.
+	ret = SQLSetConnectAttr(dbc, SQL_ATTR_LOGIN_TIMEOUT, reinterpret_cast<SQLPOINTER>(10), 0);
+	if (!SQL_SUCCEEDED(ret)) {
+		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		throw IOException("Unable to configure bounded SQL Server login");
 	}
 
 	ODBCConnectionParameters config;

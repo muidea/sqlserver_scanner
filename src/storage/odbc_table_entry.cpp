@@ -3,6 +3,7 @@
 #include "storage/odbc_table_entry.hpp"
 #include "storage/odbc_transaction.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "odbc_scanner.hpp"
 
@@ -27,8 +28,9 @@ unique_ptr<BaseStatistics> ODBCTableEntry::GetStatistics(ClientContext &context,
 	return nullptr;
 }
 
-void ODBCTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, LogicalProjection &, LogicalUpdate &,
+void ODBCTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, LogicalProjection &, LogicalUpdate &update,
                                            ClientContext &) {
+	update.update_is_del_and_insert = false;
 }
 
 TableFunction ODBCTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {

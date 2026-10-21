@@ -15,6 +15,11 @@
 #include "storage/odbc_optimizer.hpp"
 
 using namespace duckdb;
+#ifdef SQLSERVER_GUARDED_CRUD
+namespace duckdb {
+void RegisterSQLServerGuardedCRUD(ExtensionLoader &loader);
+}
+#endif
 
 static void SetODBCDebugQueryPrint(ClientContext &context, SetScope scope, Value &parameter) {
 	ODBCConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
@@ -92,6 +97,9 @@ void SetODBCSecretParameters(CreateSecretFunction &function) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+#ifdef SQLSERVER_GUARDED_CRUD
+	RegisterSQLServerGuardedCRUD(loader);
+#endif
 	// ODBC doesn't require explicit library initialization like MySQL
 	// The ODBC driver manager handles initialization automatically
 	ODBCClearCacheFunction clear_cache_func;
