@@ -15,6 +15,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <codecvt>
+#include <locale>
 #include <mutex>
 #include <thread>
 
@@ -120,6 +122,10 @@ public:
 		case 515:
 			error = "23502";
 			break;
+		case 8152:
+		case 2628:
+			error = "22001";
+			break;
 		case 8115:
 			error = "22003";
 			break;
@@ -210,9 +216,36 @@ public:
 		if (count != params.size() || count > 2100)
 			Reject();
 		vector<int64_t> values(params.size());
+		vector<vector<SQLWCHAR>> strings(params.size());
 		vector<SQLLEN> lengths(params.size(), 0);
 		for (idx_t i = 0; i < params.size(); i++) {
 			auto &v = params[i];
+			// Keep Unicode/DECIMAL/finite ISO payloads exact. Generated SQL
+			// supplies the source type CAST; neither float nor ANSI code-page
+			// conversion may change a value before the guarded statement runs.
+			if (v.type().id() == LogicalTypeId::VARCHAR) {
+				idx_t units = 0;
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+				} else {
+					auto text = v.GetValue<string>();
+					if (text.size() > 16000 || text.find('\0') != string::npos)
+						Reject();
+					std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
+					auto utf16 = converter.from_bytes(text);
+					units = utf16.size();
+					if (units > 4000)
+						Reject();
+					strings[i].assign(utf16.begin(), utf16.end());
+					lengths[i] = units * sizeof(SQLWCHAR);
+				}
+				static_assert(sizeof(SQLWCHAR) == 2, "guarded SQL Server Unicode requires 16-bit ODBC units");
+				strings[i].push_back(0);
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+				                       MaxValue<idx_t>(1, units), 0, strings[i].data(),
+				                       strings[i].size() * sizeof(SQLWCHAR), &lengths[i]));
+				continue;
+			}
 			if (v.IsNull())
 				lengths[i] = SQL_NULL_DATA;
 			else {
@@ -366,17 +399,20 @@ static string Metadata(Session &s, const Data &d) {
 	    " AND (type NOT IN(0,1,2) OR has_filter=1 OR ignore_dup_key=1 OR is_disabled=1 OR is_hypothetical=1)))");
 	if (features != "0")
 		Reject();
-	auto cols = s.Rows(
-	    "SELECT "
-	    "c.name,TYPE_NAME(c.system_type_id),CONVERT(varchar(1),c.is_nullable),CONVERT(varchar(20),c.column_id),"
-	    "CONVERT(varchar(20),c.max_length),CONVERT(varchar(20),c.[precision]),CONVERT(varchar(20),c.[scale]) FROM "
-	    "sys.columns c WHERE c.object_id=" +
-	    obj +
-	    " AND c.system_type_id=c.user_type_id AND c.system_type_id IN(52,56,127) AND c.is_identity=0 AND "
-	    "c.is_computed=0 AND c.is_rowguidcol=0 AND c.is_filestream=0 AND c.is_sparse=0 AND c.is_column_set=0 "
-	    "AND c.is_hidden=0 AND c.generated_always_type=0 AND c.encryption_type IS NULL AND "
-	    "c.default_object_id=0 AND c.rule_object_id=0 AND NOT EXISTS(SELECT 1 FROM sys.masked_columns m WHERE "
-	    "m.object_id=c.object_id AND m.column_id=c.column_id AND m.is_masked=1) ORDER BY c.column_id");
+	auto cols =
+	    s.Rows("SELECT "
+	           "c.name,TYPE_NAME(c.system_type_id),CONVERT(varchar(1),c.is_nullable),CONVERT(varchar(20),c.column_id),"
+	           "CONVERT(varchar(20),c.max_length),CONVERT(varchar(20),c.[precision]),CONVERT(varchar(20),c.[scale]),"
+	           "COALESCE(c.collation_name,'') FROM "
+	           "sys.columns c WHERE c.object_id=" +
+	           obj +
+	           " AND c.system_type_id=c.user_type_id AND ((c.system_type_id IN(52,56,127,106,108,40,231)) OR "
+	           "(c.system_type_id=42 "
+	           "AND c.scale<=6)) AND c.is_identity=0 AND "
+	           "c.is_computed=0 AND c.is_rowguidcol=0 AND c.is_filestream=0 AND c.is_sparse=0 AND c.is_column_set=0 "
+	           "AND c.is_hidden=0 AND c.generated_always_type=0 AND c.encryption_type IS NULL AND "
+	           "c.default_object_id=0 AND c.rule_object_id=0 AND NOT EXISTS(SELECT 1 FROM sys.masked_columns m WHERE "
+	           "m.object_id=c.object_id AND m.column_id=c.column_id AND m.is_masked=1) ORDER BY c.column_id");
 	auto count = s.Scalar("SELECT CONVERT(varchar(20),COUNT_BIG(*)) FROM sys.columns WHERE object_id=" + obj);
 	if (cols.empty() || cols.size() > 1024 || count != std::to_string(cols.size()))
 		Reject();
@@ -406,7 +442,19 @@ static string Metadata(Session &s, const Data &d) {
 			out += ",";
 		first = false;
 		out += "{\"name\":" + JSON(c[0]) + ",\"data_type\":" + JSON(c[1]) +
-		       ",\"nullable\":" + (c[2] == "1" ? "true" : "false") + "}";
+		       ",\"nullable\":" + (c[2] == "1" ? "true" : "false");
+		if (c[1] == "decimal" || c[1] == "numeric" || c[1] == "datetime2") {
+			if (c[5].empty() || c[6].empty() || c[5].find_first_not_of("0123456789") != string::npos ||
+			    c[6].find_first_not_of("0123456789") != string::npos)
+				Reject();
+			out += ",\"precision\":" + c[5] + ",\"scale\":" + c[6];
+		}
+		if (c[1] == "nvarchar") {
+			if (c[4].empty() || c[4].find_first_not_of("-0123456789") != string::npos || c[7].empty())
+				Reject();
+			out += ",\"max_length\":" + c[4] + ",\"collation\":" + JSON(c[7]);
+		}
+		out += "}";
 	}
 	out += "]}";
 	if (out.size() > 1024 * 1024)

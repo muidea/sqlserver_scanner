@@ -777,6 +777,13 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
+	// SQL_NULL_DATA is negative. A zero byte length is a non-NULL empty
+	// string/blob, including SQL_C_WCHAR; never erase that distinction.
+	if (f.bind_length == 0) {
+		FlatVector::GetData<string_t>(vec)[row] = StringVector::AddStringOrBlob(vec, "", 0);
+		return;
+	}
+
 	if (f.ValueBufferSize() == 0) {
 		FlatVector::SetNull(vec, row, true);
 		return;
