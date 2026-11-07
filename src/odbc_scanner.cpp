@@ -421,8 +421,25 @@ static string SQLServerMetadataLiteral(const string &value) {
 	return "'" + StringUtil::Replace(value, "'", "''") + "'";
 }
 
-static string SQLServerLegacyRelationalMetadataSQL(const string &category, const string &schema) {
-	auto condition = schema.empty() ? string() : " AND USER_NAME(t.uid)=" + SQLServerMetadataLiteral(schema);
+static string SQLServerMetadataScope(const string &schema, const vector<string> &tables, bool legacy) {
+	auto schema_column = legacy ? "USER_NAME(t.uid)" : "s.name";
+	auto condition =
+	    schema.empty() ? string() : " AND " + string(schema_column) + "=N" + SQLServerMetadataLiteral(schema);
+	if (!tables.empty()) {
+		condition += " AND t.name COLLATE Latin1_General_BIN IN (";
+		for (idx_t i = 0; i < tables.size(); i++) {
+			if (i)
+				condition += ",";
+			condition += "N" + SQLServerMetadataLiteral(tables[i]);
+		}
+		condition += ")";
+	}
+	return condition;
+}
+
+static string SQLServerLegacyRelationalMetadataSQL(const string &category, const string &schema,
+                                                   const vector<string> &tables) {
+	auto condition = SQLServerMetadataScope(schema, tables, true);
 	if (category == "columnProperties") {
 		return R"SQL(SELECT CAST(USER_NAME(t.uid) AS varchar(256)),CAST(t.name AS varchar(256)),CAST(c.name AS varchar(256)),CAST(c.colid AS varchar(20)),CAST(CASE WHEN c.isnullable=1 THEN 1 ELSE 0 END AS varchar(5)),CAST('' AS varchar(1)),CAST(0 AS varchar(5)),CAST('' AS varchar(1)),CAST('' AS varchar(1)),CAST(0 AS varchar(5)),CAST('' AS varchar(1)),CAST(ty.name AS varchar(256))
 FROM sysobjects t JOIN syscolumns c ON c.id=t.id JOIN systypes ty ON ty.xusertype=c.xusertype
@@ -449,11 +466,12 @@ WHERE t.xtype IN ('U','V'))SQL" +
 	throw InvalidInputException("Unsupported sqlserver_relational_metadata category \"%s\"", category);
 }
 
-static string SQLServerRelationalMetadataSQL(const string &category, const string &schema, bool legacy) {
+static string SQLServerRelationalMetadataSQL(const string &category, const string &schema, bool legacy,
+                                             const vector<string> &tables) {
 	if (legacy) {
-		return SQLServerLegacyRelationalMetadataSQL(category, schema);
+		return SQLServerLegacyRelationalMetadataSQL(category, schema, tables);
 	}
-	auto condition = schema.empty() ? string() : " AND s.name=" + SQLServerMetadataLiteral(schema);
+	auto condition = SQLServerMetadataScope(schema, tables, false);
 	if (category == "capabilities") {
 		return "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(128)) AS product_version";
 	}
@@ -490,8 +508,9 @@ WHERE t.is_ms_shipped=0 AND t.type IN ('U','V') AND i.index_id>0)SQL" +
 static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &context, TableFunctionBindInput &input,
                                                            vector<LogicalType> &return_types, vector<string> &names) {
 	lock_guard<std::mutex> relational_metadata_guard(relational_metadata_mutex);
-	if (input.inputs.size() > 3) {
-		throw BinderException("sqlserver_relational_metadata expects catalog, category, and optional schema");
+	if (input.inputs.size() > 4) {
+		throw BinderException(
+		    "sqlserver_relational_metadata expects catalog, category, schema and optional table scope");
 	}
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw BinderException("Parameters to sqlserver_relational_metadata cannot be NULL");
@@ -504,7 +523,22 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 			throw BinderException("Parameters to sqlserver_relational_metadata cannot be NULL");
 		}
 		schema = input.inputs[2].GetValue<string>();
-		StringUtil::Trim(schema);
+	}
+	vector<string> tables;
+	if (input.inputs.size() == 4) {
+		if (input.inputs[3].IsNull() || schema.empty())
+			throw BinderException("SQL Server metadata scope requires schema and table names");
+		for (const auto &value : ListValue::GetChildren(input.inputs[3])) {
+			if (value.IsNull())
+				throw BinderException("SQL Server metadata table scope contains NULL");
+			auto name = value.GetValue<string>();
+			if (name.empty() || name.find('\0') != string::npos ||
+			    std::find(tables.begin(), tables.end(), name) != tables.end())
+				throw BinderException("SQL Server metadata table scope contains invalid or duplicate names");
+			tables.push_back(std::move(name));
+		}
+		if (tables.empty() || tables.size() > 128)
+			throw BinderException("SQL Server metadata table scope must contain 1 to 128 names");
 	}
 	auto &db_manager = DatabaseManager::Get(context);
 	auto db = db_manager.GetDatabase(context, db_name);
@@ -532,7 +566,7 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 			throw InvalidInputException("Unable to parse SQL Server product version \"%s\"", version);
 		}
 	}
-	auto sql = SQLServerRelationalMetadataSQL(category, schema, legacy);
+	auto sql = SQLServerRelationalMetadataSQL(category, schema, legacy, tables);
 	// The ODBC timeout expires before FQE's outer metadata deadline. This is
 	// essential: asynchronously interrupting a driver call can leave DuckDB's
 	// bind state alive after its native resources have been released.
