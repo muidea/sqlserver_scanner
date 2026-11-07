@@ -550,7 +550,6 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction()
     : TableFunction("sqlserver_relational_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCScan,
                     ODBCRelationalMetadataBind, ODBCQueryInitGlobalState, ODBCInitLocalState) {
-	varargs = LogicalType::VARCHAR;
 	serialize = ODBCScanSerialize;
 	deserialize = ODBCScanDeserialize;
 }

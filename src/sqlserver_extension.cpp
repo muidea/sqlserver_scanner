@@ -111,8 +111,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ODBCMetadataFunction metadata_function;
 	loader.RegisterFunction(metadata_function);
 
+	// Declare the two supported forms explicitly. Instance initialization can
+	// inspect the signatures without executing a source-dependent binder.
 	ODBCRelationalMetadataFunction relational_metadata_function;
-	loader.RegisterFunction(relational_metadata_function);
+	TableFunctionSet relational_metadata("sqlserver_relational_metadata");
+	relational_metadata.AddFunction(relational_metadata_function);
+	relational_metadata_function.arguments.push_back(LogicalType::VARCHAR);
+	relational_metadata.AddFunction(relational_metadata_function);
+	loader.RegisterFunction(relational_metadata);
 
 	SecretType secret_type;
 	secret_type.name = "sqlserver";
