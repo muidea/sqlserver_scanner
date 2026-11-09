@@ -1,3 +1,4 @@
+#include "query_source_error.hpp"
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -38,8 +39,9 @@ struct GuardedODBCSourceError {
 	string JSON() const {
 		if (message.empty())
 			return "";
-		return "{\"version\":1,\"product\":" + Quote(product) + ",\"state\":" + Quote(state) +
-		       ",\"code\":" + Quote(code) + ",\"message\":" + Quote(message) + ",\"detail\":" + Quote(detail) + "}";
+		return "{\"version\":1,\"product\":" + Quote(product.empty() ? "odbc" : product) +
+		       ",\"state\":" + Quote(state) + ",\"code\":" + Quote(code) + ",\"message\":" + Quote(message) +
+		       ",\"detail\":" + Quote(detail) + "}";
 	}
 };
 // A descriptor/shape refusal is local evidence, never a source connection error.
@@ -138,7 +140,8 @@ inline GuardedODBCSourceError ReadGuardedODBCSourceError(SQLSMALLINT kind, SQLHA
 class GuardedODBCConnectionFailure : public IOException {
 public:
 	explicit GuardedODBCConnectionFailure(GuardedODBCSourceError diagnostic_p)
-	    : IOException("%s", diagnostic_p.message), diagnostic(std::move(diagnostic_p)) {
+	    : IOException("%s", QuerySourceMessage(diagnostic_p.JSON(), diagnostic_p.message, "source_connect")),
+	      diagnostic(std::move(diagnostic_p)) {
 	}
 	GuardedODBCSourceError diagnostic;
 };
