@@ -939,81 +939,89 @@ void ODBCResult::WriteToChunk(DataChunk &chunk, idx_t row) {
 			continue;
 		}
 
-		switch (vec.GetType().id()) {
-		case LogicalTypeId::BOOLEAN: {
-			WriteBool(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::TINYINT: {
-			WriteNumber<int8_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::UTINYINT: {
-			WriteNumber<uint8_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::SMALLINT: {
-			WriteNumber<int16_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::USMALLINT: {
-			WriteNumber<uint16_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::INTEGER: {
-			WriteNumber<int32_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::UINTEGER: {
-			WriteNumber<uint32_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::BIGINT: {
-			WriteNumber<int64_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::UBIGINT: {
-			WriteNumber<uint64_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::FLOAT: {
-			WriteNumber<float>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::DOUBLE: {
-			if (f.c_type == SQL_C_CHAR) {
-				WriteDoubleFromString(f, vec, row);
-			} else if (f.c_type == SQL_C_DOUBLE) {
-				WriteNumber<double>(f, vec, row);
-			} else {
-				throw InvalidInputException("Unsupported SQL Server DOUBLE transfer type for column %s", f.name);
+		try {
+			switch (vec.GetType().id()) {
+			case LogicalTypeId::BOOLEAN: {
+				WriteBool(f, vec, row);
+				break;
 			}
-			break;
-		}
-		case LogicalTypeId::VARCHAR: {
-			WriteString(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::BLOB: {
-			WriteString(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::DECIMAL: {
-			// DECIMAL types are typically passed as strings in ODBC
-			// We need to parse the string and convert to appropriate decimal value
-			WriteDecimal(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::DATE:
-		case LogicalTypeId::TIME:
-		case LogicalTypeId::TIMESTAMP:
-		case LogicalTypeId::TIMESTAMP_TZ: {
-			WriteDateTime(f, vec, row);
-			break;
-		}
-		default: {
-			WriteString(f, vec, row);
-		}
+			case LogicalTypeId::TINYINT: {
+				WriteNumber<int8_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::UTINYINT: {
+				WriteNumber<uint8_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::SMALLINT: {
+				WriteNumber<int16_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::USMALLINT: {
+				WriteNumber<uint16_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::INTEGER: {
+				WriteNumber<int32_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::UINTEGER: {
+				WriteNumber<uint32_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::BIGINT: {
+				WriteNumber<int64_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::UBIGINT: {
+				WriteNumber<uint64_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::FLOAT: {
+				WriteNumber<float>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::DOUBLE: {
+				if (f.c_type == SQL_C_CHAR) {
+					WriteDoubleFromString(f, vec, row);
+				} else if (f.c_type == SQL_C_DOUBLE) {
+					WriteNumber<double>(f, vec, row);
+				} else {
+					throw InvalidInputException("Unsupported SQL Server DOUBLE transfer type for column %s", f.name);
+				}
+				break;
+			}
+			case LogicalTypeId::VARCHAR: {
+				WriteString(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::BLOB: {
+				WriteString(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::DECIMAL: {
+				// DECIMAL types are typically passed as strings in ODBC
+				// We need to parse the string and convert to appropriate decimal value
+				WriteDecimal(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::DATE:
+			case LogicalTypeId::TIME:
+			case LogicalTypeId::TIMESTAMP:
+			case LogicalTypeId::TIMESTAMP_TZ: {
+				WriteDateTime(f, vec, row);
+				break;
+			}
+			default: {
+				WriteString(f, vec, row);
+			}
+			}
+		} catch (const std::exception &error) {
+			auto diagnostic = QueryResultErrorMessage(error, "odbc", query, f.name, vec.GetType().ToString());
+			if (diagnostic.empty()) {
+				throw;
+			}
+			throw IOException("%s", diagnostic);
 		}
 	}
 }

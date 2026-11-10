@@ -25,6 +25,7 @@ inline string QueryODBCProduct(SQLHDBC connection) {
 	// Capture the entire area before SQLGetInfo or cleanup changes diagnostics.
 	auto source = ReadGuardedODBCSourceError(kind, handle, "odbc");
 	source.product = QueryODBCProduct(connection);
-	throw IOException("%s", QuerySourceMessage(source.JSON(), source.message, stage, query));
+	throw IOException("%s", QuerySourceMessage(source.state.empty() || source.state == "00000" ? "" : source.JSON(),
+	                                           source.message, stage, query, "odbc"));
 }
 } // namespace duckdb
