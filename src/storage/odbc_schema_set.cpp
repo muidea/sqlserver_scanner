@@ -55,9 +55,9 @@ ORDER BY SCHEMA_NAME
 		}
 	}
 
-	auto default_schema = catalog.Cast<ODBCCatalog>().GetDefaultSchema();
-	if (!default_schema.empty()) {
-		schema_names.push_back(default_schema);
+	auto default_schema_opt = catalog.Cast<ODBCCatalog>().GetDefaultSchema();
+	if (default_schema_opt.has_value() && !default_schema_opt->GetIdentifierName().empty()) {
+		schema_names.push_back(default_schema_opt->GetIdentifierName());
 	}
 	if (schema_names.empty()) {
 		schema_names.emplace_back("dbo");
@@ -70,7 +70,7 @@ ORDER BY SCHEMA_NAME
 			continue;
 		}
 		CreateSchemaInfo info;
-		info.schema = std::move(normalized);
+		info.SetSchema(Identifier(normalized));
 		info.internal = false;
 		CreateEntry(make_uniq<ODBCSchemaEntry>(catalog, info));
 	}

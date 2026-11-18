@@ -51,7 +51,7 @@ static bool ODBCMetadataSchemaIsInternal(const string &name) {
 
 static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindData &bind_data,
                                      SchemaCatalogEntry &schema) {
-	if (ODBCMetadataSchemaIsInternal(schema.name)) {
+	if (ODBCMetadataSchemaIsInternal(schema.name.GetIdentifierName())) {
 		return;
 	}
 	schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
@@ -60,11 +60,11 @@ static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindDat
 		int64_t ordinal = 1;
 		for (auto &column : table.GetColumns().Logical()) {
 			ODBCMetadataRow row;
-			row.table_schema = schema.name;
-			row.table_name = table.name;
+			row.table_schema = schema.name.GetIdentifierName();
+			row.table_name = table.name.GetIdentifierName();
 			row.table_type = sqlserver_table.IsView() ? "VIEW" : "BASE TABLE";
 			row.table_comment = "";
-			row.column_name = column.GetName();
+			row.column_name = column.GetName().GetIdentifierName();
 			row.data_type = column.GetType().ToString();
 			row.ordinal_position = ordinal++;
 			row.column_comment = "";
@@ -74,13 +74,14 @@ static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindDat
 }
 
 static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("Parameters to sqlserver_metadata cannot be NULL");
 	}
 
-	names = {"table_schema", "table_name", "table_type",       "table_comment",
-	         "column_name",  "data_type",  "ordinal_position", "column_comment"};
+	names = {Identifier("table_schema"), Identifier("table_name"),  Identifier("table_type"),
+	         Identifier("table_comment"), Identifier("column_name"), Identifier("data_type"),
+	         Identifier("ordinal_position"), Identifier("column_comment")};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR};
 
@@ -91,7 +92,7 @@ static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFu
 		StringUtil::Trim(schema_filter);
 	}
 	auto &db_manager = DatabaseManager::Get(context);
-	auto db = db_manager.GetDatabase(context, db_name);
+	auto db = db_manager.GetDatabase(context, Identifier(db_name));
 	if (!db) {
 		throw BinderException("Failed to find attached database \"%s\" referenced in sqlserver_metadata", db_name);
 	}
@@ -103,7 +104,7 @@ static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFu
 	auto bind_data = make_uniq<ODBCMetadataBindData>();
 	auto &odbc_catalog = catalog.Cast<ODBCCatalog>();
 	if (!schema_filter.empty()) {
-		auto &schema = odbc_catalog.GetSchema(context, schema_filter);
+		auto &schema = odbc_catalog.GetSchema(context, Identifier(schema_filter));
 		ODBCMetadataAppendSchema(context, *bind_data, schema);
 	} else {
 		odbc_catalog.ScanSchemas(
@@ -139,7 +140,7 @@ static void ODBCMetadataScan(ClientContext &context, TableFunctionInput &data, D
 ODBCMetadataFunction::ODBCMetadataFunction()
     : TableFunction("sqlserver_metadata", {LogicalType::VARCHAR}, ODBCMetadataScan, ODBCMetadataBind,
                     ODBCMetadataInitGlobalState) {
-	varargs = LogicalType::VARCHAR;
+	GetSignature().AddArgs("schemas", LogicalType::VARCHAR);
 }
 
 } // namespace duckdb

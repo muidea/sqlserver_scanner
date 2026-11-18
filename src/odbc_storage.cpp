@@ -2,8 +2,11 @@
 
 #include "odbc_storage.hpp"
 #include "storage/odbc_catalog.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/storage/storage_extension.hpp"
 #include "storage/odbc_transaction_manager.hpp"
 
 namespace duckdb {

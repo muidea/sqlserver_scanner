@@ -19,14 +19,14 @@ struct ODBCTableInfo {
 		create_info = make_uniq<CreateTableInfo>();
 	}
 	ODBCTableInfo(const string &schema, const string &table, bool is_view_p = false) : is_view(is_view_p) {
-		create_info = make_uniq<CreateTableInfo>(string(), schema, table);
+		create_info = make_uniq<CreateTableInfo>(QualifiedName(Identifier(), Identifier(schema), Identifier(table)));
 	}
 	ODBCTableInfo(const SchemaCatalogEntry &schema, const string &table, bool is_view_p = false) : is_view(is_view_p) {
-		create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)schema, table);
+		create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)schema, Identifier(table));
 	}
 
 	const string &GetTableName() const {
-		return create_info->table;
+		return create_info->GetTableName().GetIdentifierName();
 	}
 
 	unique_ptr<CreateTableInfo> create_info;
@@ -40,6 +40,8 @@ public:
 	ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, ODBCTableInfo &info);
 
 public:
+	const ColumnList &GetColumns() const override;
+
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
@@ -53,6 +55,9 @@ public:
 	bool IsView() const {
 		return is_view;
 	}
+
+protected:
+	ColumnList columns;
 
 private:
 	bool is_view = false;

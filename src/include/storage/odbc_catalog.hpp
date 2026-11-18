@@ -9,6 +9,12 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/storage/database_size.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "storage/odbc_schema_set.hpp"
 #include "storage/odbc_connection_pool.hpp"
 
@@ -68,8 +74,8 @@ public:
 	ODBCConnectionPool &GetConnectionPool() {
 		return connection_pool;
 	}
-	string GetDefaultSchema() const override {
-		return default_schema;
+	optional<Identifier> GetDefaultSchema() const override {
+		return Identifier(default_schema);
 	}
 
 private:

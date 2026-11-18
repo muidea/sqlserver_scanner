@@ -4,7 +4,7 @@ namespace duckdb {
 
 static bool GetBoolOption(ClientContext &context, const string &name) {
 	Value value;
-	return context.TryGetCurrentSetting(name, value) && BooleanValue::Get(value);
+	return context.TryGetCurrentSetting(Identifier(name), value) && BooleanValue::Get(value);
 }
 
 ODBCTypeConfig::ODBCTypeConfig() {

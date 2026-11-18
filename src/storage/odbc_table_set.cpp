@@ -25,7 +25,8 @@ static bool ODBCSchemaIsInternal(const string &name) {
 }
 
 void ODBCTableSet::LoadEntries(ClientContext &context) {
-	if (ODBCSchemaIsInternal(schema.name)) {
+	const auto &schema_name = schema.name.GetIdentifierName();
+	if (ODBCSchemaIsInternal(schema_name)) {
 		return;
 	}
 
@@ -64,7 +65,7 @@ WHERE s.name = ${SCHEMA_NAME}
   AND t.type IN ('U', 'V')
 ORDER BY t.name, c.column_id
 )",
-	                                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+	                                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name));
 	auto legacy_query = StringUtil::Replace(R"(
 SELECT
     CAST(t.name AS varchar(128)) AS TABLE_NAME,
@@ -81,7 +82,7 @@ WHERE t.uid = USER_ID(${SCHEMA_NAME})
   AND t.xtype IN ('U', 'V')
 ORDER BY t.name, c.colid
 )",
-	                                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+	                                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name));
 	auto result = transaction.Query(legacy ? legacy_query : modern_query);
 
 	unordered_map<string, unique_ptr<ODBCTableInfo>> table_infos;
@@ -111,7 +112,7 @@ ORDER BY t.name, c.colid
 		type_info.precision = result->IsNull(4) ? -1 : result->GetInt64(4);
 		type_info.scale = result->IsNull(5) ? -1 : result->GetInt64(5);
 
-		ColumnDefinition column(std::move(column_name), ODBCTypes::TypeToLogicalType(type_config, type_info));
+		ColumnDefinition column(Identifier(std::move(column_name)), ODBCTypes::TypeToLogicalType(type_config, type_info));
 		table_info->create_info->columns.AddColumn(std::move(column));
 		table_info->remote_column_names.push_back(std::move(remote_column_name));
 	}
@@ -132,7 +133,7 @@ static string GetTableInfoQuery(const string &schema_name, const string &table_n
 unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODBCSchemaEntry &schema,
                                                      const string &table_name, bool is_view) {
 	auto &transaction = ODBCTransaction::Get(context, schema.ParentCatalog());
-	auto result = transaction.Query(GetTableInfoQuery(schema.name, table_name));
+	auto result = transaction.Query(GetTableInfoQuery(schema.name.GetIdentifierName(), table_name));
 	auto table_info = make_uniq<ODBCTableInfo>(schema, table_name, is_view);
 	for (auto &field : result->Fields()) {
 		auto remote_column_name = field.name;
@@ -140,7 +141,7 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 		if (column_name.empty()) {
 			continue;
 		}
-		ColumnDefinition column(std::move(column_name), field.duckdb_type);
+		ColumnDefinition column(Identifier(std::move(column_name)), field.duckdb_type);
 		table_info->create_info->columns.AddColumn(std::move(column));
 		table_info->remote_column_names.push_back(std::move(remote_column_name));
 	}

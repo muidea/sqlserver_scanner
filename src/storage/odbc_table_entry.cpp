@@ -14,14 +14,18 @@ static bool TableIsInternal(const SchemaCatalogEntry &schema, const string &name
 }
 
 ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-    : TableCatalogEntry(catalog, schema, info) {
-	this->internal = TableIsInternal(schema, name);
+    : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)) {
+	this->internal = TableIsInternal(schema, name.GetIdentifierName());
 }
 
 ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, ODBCTableInfo &info)
     : TableCatalogEntry(catalog, schema, *info.create_info), remote_column_names(info.remote_column_names),
-      is_view(info.is_view) {
-	this->internal = TableIsInternal(schema, name);
+      columns(std::move(info.create_info->columns)), is_view(info.is_view) {
+	this->internal = TableIsInternal(schema, name.GetIdentifierName());
+}
+
+const ColumnList &ODBCTableEntry::GetColumns() const {
+	return columns;
 }
 
 unique_ptr<BaseStatistics> ODBCTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
@@ -38,11 +42,11 @@ TableFunction ODBCTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 	idx_t column_index = 0;
 	for (auto &col : columns.Logical()) {
 		result->types.push_back(col.GetType());
-		result->names.push_back(col.GetName());
+		result->names.push_back(col.GetName().GetIdentifierName());
 		if (column_index < remote_column_names.size()) {
 			result->remote_names.push_back(remote_column_names[column_index]);
 		} else {
-			result->remote_names.push_back(col.GetName());
+			result->remote_names.push_back(col.GetName().GetIdentifierName());
 		}
 		column_index++;
 	}
@@ -51,7 +55,7 @@ TableFunction ODBCTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 
 	auto function = ODBCScanFunction();
 	Value filter_pushdown;
-	if (context.TryGetCurrentSetting("sqlserver_experimental_filter_pushdown", filter_pushdown)) {
+	if (context.TryGetCurrentSetting(Identifier("sqlserver_experimental_filter_pushdown"), filter_pushdown)) {
 		function.filter_pushdown = BooleanValue::Get(filter_pushdown);
 	}
 	return function;

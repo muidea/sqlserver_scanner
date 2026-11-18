@@ -14,13 +14,13 @@ void GatherODBCScans(LogicalOperator &op, ODBCOperators &result) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		auto &table_scan = get.function;
-		if (ODBCCatalog::IsODBCScan(table_scan.name)) {
+		if (ODBCCatalog::IsODBCScan(table_scan.GetName().GetIdentifierName())) {
 			// odbc table scan - add to the catalog
 			auto &bind_data = get.bind_data->Cast<ODBCBindData>();
 			auto &catalog = bind_data.table.ParentCatalog().Cast<ODBCCatalog>();
 			result.scans[catalog].push_back(get);
 		}
-		if (ODBCCatalog::IsODBCQuery(table_scan.name)) {
+		if (ODBCCatalog::IsODBCQuery(table_scan.GetName().GetIdentifierName())) {
 			auto &bind_data = get.bind_data->Cast<ODBCQueryBindData>();
 			auto &catalog = bind_data.catalog.Cast<ODBCCatalog>();
 			result.scans[catalog].push_back(get);
@@ -43,7 +43,7 @@ void OptimizeODBCScan(unique_ptr<LogicalOperator> &op) {
 			return;
 		}
 		auto &get = child.get().Cast<LogicalGet>();
-		if (!ODBCCatalog::IsODBCScan(get.function.name)) {
+		if (!ODBCCatalog::IsODBCScan(get.function.GetName().GetIdentifierName())) {
 			return;
 		}
 		switch (limit.limit_val.Type()) {
@@ -93,7 +93,7 @@ void ODBCOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalO
 		}
 		for (auto &logical_get : entry.second) {
 			auto &get = logical_get.get();
-			if (ODBCCatalog::IsODBCScan(get.function.name)) {
+			if (ODBCCatalog::IsODBCScan(get.function.GetName().GetIdentifierName())) {
 				// odbc table scan - add to the catalog
 				auto &bind_data = get.bind_data->Cast<ODBCBindData>();
 				if (bind_data.streaming == ODBCResultStreaming::UNINITIALIZED ||
@@ -101,7 +101,7 @@ void ODBCOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalO
 					bind_data.streaming = result_streaming;
 				}
 			}
-			if (ODBCCatalog::IsODBCQuery(get.function.name)) {
+			if (ODBCCatalog::IsODBCQuery(get.function.GetName().GetIdentifierName())) {
 				auto &bind_data = get.bind_data->Cast<ODBCQueryBindData>();
 				if (bind_data.streaming == ODBCResultStreaming::UNINITIALIZED ||
 				    result_streaming == ODBCResultStreaming::FORCE_MATERIALIZATION) {

@@ -51,7 +51,7 @@ optional_ptr<CatalogEntry> ODBCCatalogSet::CreateEntry(unique_ptr<CatalogEntry> 
 	if (result->name.empty()) {
 		throw InternalException("ODBCCatalogSet::CreateEntry called with empty name");
 	}
-	entries.insert(make_pair(result->name, std::move(entry)));
+	entries.insert(make_pair(result->name.GetIdentifierName(), std::move(entry)));
 	return result;
 }
 
