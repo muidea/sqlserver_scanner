@@ -370,7 +370,7 @@ void ODBCResult::ReadAllData() {
 		}
 
 		// 设置数据块大小并添加到缓存
-		chunk->SetCardinality(r);
+		chunk->SetChildCardinality(r);
 		cached_chunks.push_back(std::move(chunk));
 
 		// 如果读取的行数少于标准向量大小，说明已经读取完所有数据
@@ -479,7 +479,7 @@ DataChunk &ODBCResult::NextChunk() {
 		data_chunk.Reset();
 
 		if (stream_exhausted) {
-			data_chunk.SetCardinality(0);
+			data_chunk.SetChildCardinality(0);
 			return data_chunk;
 		}
 
@@ -492,7 +492,7 @@ DataChunk &ODBCResult::NextChunk() {
 			WriteToChunk(data_chunk, r);
 		}
 
-		data_chunk.SetCardinality(r);
+		data_chunk.SetChildCardinality(r);
 
 		if (stream_exhausted) {
 			stmt.reset();
@@ -513,7 +513,7 @@ DataChunk &ODBCResult::NextChunk() {
 	}
 
 	data_chunk.Reset();
-	data_chunk.SetCardinality(0);
+	data_chunk.SetChildCardinality(0);
 	return data_chunk;
 }
 

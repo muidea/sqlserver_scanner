@@ -155,13 +155,13 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 
 	// 空结果集，设置输出为空
 	if (res_chunk.size() == 0) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
 	// 没有列的结果集，设置输出为空
 	if (res_chunk.ColumnCount() == 0) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -205,7 +205,7 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 			throw BinderException(error);
 		}
 	}
-	output.SetCardinality(res_chunk.size());
+	output.SetChildCardinality(res_chunk.size());
 }
 
 static InsertionOrderPreservingMap<string> ODBCScanToString(TableFunctionToStringInput &input) {
