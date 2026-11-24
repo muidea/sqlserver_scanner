@@ -18,6 +18,7 @@ using namespace duckdb;
 #ifdef SQLSERVER_GUARDED_CRUD
 namespace duckdb {
 void RegisterSQLServerGuardedCRUD(ExtensionLoader &loader);
+void RegisterSQLServerGuardedDDL(ExtensionLoader &loader);
 }
 #endif
 
@@ -99,6 +100,7 @@ void SetODBCSecretParameters(CreateSecretFunction &function) {
 static void LoadInternal(ExtensionLoader &loader) {
 #ifdef SQLSERVER_GUARDED_CRUD
 	RegisterSQLServerGuardedCRUD(loader);
+	RegisterSQLServerGuardedDDL(loader);
 #endif
 	// ODBC doesn't require explicit library initialization like MySQL
 	// The ODBC driver manager handles initialization automatically

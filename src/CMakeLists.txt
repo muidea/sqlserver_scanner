@@ -15,7 +15,7 @@ add_library(
   odbc_types.cpp
   odbc_utils.cpp)
 if(SQLSERVER_GUARDED_CRUD)
-  target_sources(odbc_ext_library PRIVATE sqlserver_guarded_crud.cpp)
+  target_sources(odbc_ext_library PRIVATE sqlserver_guarded_crud.cpp sqlserver_guarded_ddl.cpp)
 endif()
 
 set(ALL_OBJECT_FILES
