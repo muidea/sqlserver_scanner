@@ -26,6 +26,7 @@ struct ODBCBindData : public FunctionData {
 	vector<ODBCType> odbc_types;
 	vector<string> names;
 	vector<string> remote_names;
+	vector<string> remote_type_names;
 	vector<LogicalType> types;
 	string limit;
 	ODBCResultStreaming streaming = ODBCResultStreaming::UNINITIALIZED;

@@ -836,7 +836,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		version = s.Scalar("SELECT CONVERT(varchar(128),SERVERPROPERTY('ProductVersion'))");
 		if (!CompatibleVersion(version) || (d.execute && version != d.version))
 			Reject();
-		s.Exec("SET XACT_ABORT ON;SET NOCOUNT OFF;SET ANSI_WARNINGS ON;SET ANSI_NULLS ON;SET QUOTED_IDENTIFIER ON;SET "
+		s.Exec("SET DATEFORMAT ymd;SET XACT_ABORT ON;SET NOCOUNT OFF;SET ANSI_WARNINGS ON;SET ANSI_NULLS ON;SET QUOTED_IDENTIFIER ON;SET "
 		       "ARITHABORT ON;SET NUMERIC_ROUNDABORT OFF;SET LOCK_TIMEOUT 5000;SET TRANSACTION ISOLATION LEVEL "
 		       "SERIALIZABLE;BEGIN TRANSACTION");
 		s.Rows("SELECT TOP(1) CONVERT(varchar(1),1) FROM " + Identifier(d.schema) + "." + Identifier(d.table) +

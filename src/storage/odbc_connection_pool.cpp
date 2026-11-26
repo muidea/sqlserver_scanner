@@ -93,23 +93,32 @@ ODBCPoolConnection ODBCConnectionPool::GetConnection() {
 }
 
 void ODBCConnectionPool::ReturnConnection(shared_ptr<ODBCConnection> connection) {
+	bool should_reset = false;
+	{
+		lock_guard<mutex> l(connection_lock);
+		if (active_connections <= 0) {
+			throw InternalException("ODBCConnectionPool::ReturnConnection called but active_connections is 0");
+		}
+		active_connections--;
+		if (active_connections < maximum_connections && connection && connection->IsOpen() &&
+		    odbc_use_connection_cache.load(std::memory_order_relaxed)) {
+			should_reset = true;
+		}
+	}
+	if (!should_reset) {
+		return;
+	}
+	try {
+		connection->ResetSessionTemporalSettings();
+	} catch (...) {
+		connection->Close();
+		return;
+	}
 	lock_guard<mutex> l(connection_lock);
-	if (active_connections <= 0) {
-		throw InternalException("ODBCConnectionPool::ReturnConnection called but active_connections is 0");
+	if (active_connections < maximum_connections && active_connections + connection_cache.size() < maximum_connections &&
+	    odbc_use_connection_cache.load(std::memory_order_relaxed) && connection->IsOpen()) {
+		connection_cache.push_back(std::move(connection));
 	}
-	active_connections--;
-	if (active_connections >= maximum_connections) {
-		// if the maximum number of connections has been decreased by the user we might need to reclaim the connection
-		// immediately
-		return;
-	}
-	if (!connection || !connection->IsOpen() || !odbc_use_connection_cache.load(std::memory_order_relaxed)) {
-		return;
-	}
-	// check if the underlying connection is still usable
-	// For ODBC, we need to check if the connection is still valid
-	// This is a simplified check - in production we might need more robust connection health checking
-	connection_cache.push_back(std::move(connection));
 }
 
 void ODBCConnectionPool::SetMaximumConnections(idx_t new_max) {

@@ -20,7 +20,7 @@ ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Cre
 
 ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, ODBCTableInfo &info)
     : TableCatalogEntry(catalog, schema, *info.create_info), remote_column_names(info.remote_column_names),
-      is_view(info.is_view) {
+      remote_type_names(info.remote_type_names), is_view(info.is_view) {
 	this->internal = TableIsInternal(schema, name);
 }
 
@@ -43,6 +43,11 @@ TableFunction ODBCTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 			result->remote_names.push_back(remote_column_names[column_index]);
 		} else {
 			result->remote_names.push_back(col.GetName());
+		}
+		if (column_index < remote_type_names.size()) {
+			result->remote_type_names.push_back(remote_type_names[column_index]);
+		} else {
+			result->remote_type_names.emplace_back();
 		}
 		column_index++;
 	}

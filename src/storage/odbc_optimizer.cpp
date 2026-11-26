@@ -2,6 +2,7 @@
 #include "storage/odbc_catalog.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "odbc_filter_pushdown.hpp"
 #include "odbc_scanner.hpp"
 
 namespace duckdb {
@@ -66,8 +67,23 @@ void OptimizeODBCScan(unique_ptr<LogicalOperator> &op) {
 			// Keep OFFSET local until the supported SQL Server version is known.
 			return;
 		}
+		auto &bind_data = get.bind_data->Cast<ODBCBindData>();
+		if (!get.table_filters.filters.empty()) {
+			vector<column_t> col_ids;
+			const auto &logical_col_ids = get.GetColumnIds();
+			col_ids.reserve(logical_col_ids.size());
+			for (const auto &col_idx : logical_col_ids) {
+				col_ids.push_back(col_idx.IsRowIdColumn() ? COLUMN_IDENTIFIER_ROW_ID : col_idx.GetPrimaryIndex());
+			}
+			const auto &filter_names = bind_data.remote_names.empty() ? bind_data.names : bind_data.remote_names;
+			auto pushdown = ODBCFilterPushdown::TransformFiltersWithFallback(col_ids, &get.table_filters, filter_names,
+			                                                                   bind_data.remote_type_names);
+			if (!pushdown.unpushed_filter_columns.empty()) {
+				// Keep LIMIT local when any column filter must execute in DuckDB.
+				return;
+			}
+		}
 		if (limit.limit_val.Type() != LimitNodeType::UNSET) {
-			auto &bind_data = get.bind_data->Cast<ODBCBindData>();
 			// SQL Server TOP does not require ORDER BY and is supported across the
 			// target server versions.
 			bind_data.limit = to_string(limit.limit_val.GetConstantValue());

@@ -1147,7 +1147,7 @@ static void DDLExecScan(ClientContext &ctx, TableFunctionInput &in, DataChunk &o
 		}
 
 		// Session safety settings + short lock timeout (2000ms) so DDL fails fast when online traffic holds locks.
-		s.Exec("SET XACT_ABORT ON;SET NOCOUNT OFF;SET ANSI_NULLS ON;SET QUOTED_IDENTIFIER ON;"
+		s.Exec("SET DATEFORMAT ymd;SET XACT_ABORT ON;SET NOCOUNT OFF;SET ANSI_NULLS ON;SET QUOTED_IDENTIFIER ON;"
 		       "SET ANSI_WARNINGS ON;SET ARITHABORT ON;SET NUMERIC_ROUNDABORT OFF;SET LOCK_TIMEOUT 2000;"
 		       "BEGIN TRANSACTION");
 		in_tx = true;

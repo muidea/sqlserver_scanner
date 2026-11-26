@@ -14,8 +14,12 @@
 #include <sql.h>
 #include <sqlext.h>
 
+#include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "sqlserver_temporal_utils.hpp"
 
 #include "storage/odbc_schema_entry.hpp"
 #include "storage/odbc_transaction.hpp"
@@ -469,21 +473,103 @@ static string TransformBlobToODBC(const string &val) {
 	return result;
 }
 
-string ODBCUtils::TransformConstant(const Value &val) {
+bool ODBCUtils::TryTransformConstant(const Value &val, const string &remote_type_name, string &out) {
+	if (val.IsNull()) {
+		out = "NULL";
+		return true;
+	}
 	if (val.type().id() == LogicalTypeId::BOOLEAN) {
-		return BooleanValue::Get(val) ? "1" : "0";
+		out = BooleanValue::Get(val) ? "1" : "0";
+		return true;
 	}
 	if (val.type().IsNumeric()) {
-		return val.ToSQLString();
+		out = val.ToSQLString();
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::BLOB) {
-		return TransformBlobToODBC(StringValue::Get(val));
+		out = TransformBlobToODBC(StringValue::Get(val));
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::DATE) {
+		date_t d = DateValue::Get(val);
+		if (!Date::IsFinite(d)) {
+			return false;
+		}
+		int32_t year, month, day;
+		Date::Convert(d, year, month, day);
+		if (!IsSQLServerDateYearInRange(year)) {
+			return false;
+		}
+		out = "CAST(" + WriteLiteral(FormatSQLServerDateISO(year, month, day)) + " AS DATE)";
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::TIME) {
+		dtime_t tm = TimeValue::Get(val);
+		int32_t hour, minute, second, micros;
+		Time::Convert(tm, hour, minute, second, micros);
+		if (!IsSQLServerTimeInRange(hour, minute, second, micros)) {
+			return false;
+		}
+		out = "CAST(" + WriteLiteral(FormatSQLServerTimeISO(hour, minute, second, micros)) + " AS TIME(6))";
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::TIMESTAMP) {
+		timestamp_t ts = TimestampValue::Get(val);
+		if (!Timestamp::IsFinite(ts)) {
+			return false;
+		}
+		date_t d;
+		dtime_t tm;
+		Timestamp::Convert(ts, d, tm);
+		int32_t year, month, day, hour, minute, second, micros;
+		Date::Convert(d, year, month, day);
+		Time::Convert(tm, hour, minute, second, micros);
+		auto lower_remote = StringUtil::Lower(remote_type_name);
+		StringUtil::Trim(lower_remote);
+		if (lower_remote == "datetime") {
+			if (!IsSQLServerDateTimeInRange(year) || !IsSQLServerDateTimeExactTick(micros)) {
+				return false;
+			}
+			out = "CONVERT(datetime, " + WriteLiteral(FormatSQLServerDateTime126(year, month, day, hour, minute, second, micros)) +
+			      ", 126)";
+			return true;
+		}
+		if (!IsSQLServerDateYearInRange(year)) {
+			return false;
+		}
+		out = "CAST(" +
+		      WriteLiteral(FormatSQLServerTimestampISO(year, month, day, hour, minute, second, micros, false)) +
+		      " AS DATETIME2(6))";
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		auto ts_text = Timestamp::ToString(timestamp_t(val.GetValueUnsafe<int64_t>())) + "+00:00";
-		return WriteLiteral(ts_text);
+		timestamp_t ts(val.GetValueUnsafe<int64_t>());
+		if (!Timestamp::IsFinite(ts)) {
+			return false;
+		}
+		date_t d;
+		dtime_t tm;
+		Timestamp::Convert(ts, d, tm);
+		int32_t year, month, day, hour, minute, second, micros;
+		Date::Convert(d, year, month, day);
+		Time::Convert(tm, hour, minute, second, micros);
+		if (!IsSQLServerDateYearInRange(year)) {
+			return false;
+		}
+		out = "CAST(" + WriteLiteral(FormatSQLServerTimestampISO(year, month, day, hour, minute, second, micros, true)) +
+		      " AS DATETIMEOFFSET(6))";
+		return true;
 	}
-	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	out = val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	return true;
+}
+
+string ODBCUtils::TransformConstant(const Value &val) {
+	string result;
+	if (!TryTransformConstant(val, "", result)) {
+		throw ConversionException("Value cannot be pushed to SQL Server: %s", val.ToString());
+	}
+	return result;
 }
 
 } // namespace duckdb

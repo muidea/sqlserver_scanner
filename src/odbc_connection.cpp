@@ -9,6 +9,7 @@
 
 #include "odbc_parameter.hpp"
 #include "odbc_types.hpp"
+#include "sqlserver_temporal_utils.hpp"
 #include "encoding_utils.hpp"
 namespace duckdb {
 
@@ -74,7 +75,13 @@ shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, cons
 	SQLHENV env = SQL_NULL_HENV;
 	SQLHDBC dbc = ODBCUtils::Connect(connection_string, env);
 	auto owned_connection = make_shared_ptr<OwnedODBCConnection>(dbc, env);
-	return make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
+	auto conn = make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
+	conn->ResetSessionTemporalSettings();
+	return conn;
+}
+
+void ODBCConnection::ResetSessionTemporalSettings() {
+	Execute(SQLSERVER_SESSION_TEMPORAL_SQL);
 }
 
 idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming,
@@ -97,7 +104,8 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 
 		try {
 			retcode = SQLExecDirectWithFallback(hstmt, query);
-			if (!SQL_SUCCEEDED(retcode)) {
+			// FreeTDS returns SQL_NO_DATA for SET statements and 0-row DML without diagnostics.
+			if (!SQL_SUCCEEDED(retcode) && retcode != SQL_NO_DATA) {
 				ThrowQueryODBCError(SQL_HANDLE_STMT, hstmt, GetConn(), "source_execute", query);
 			}
 		} catch (const std::exception &) {
@@ -130,6 +138,9 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	// prepare path, so execute them directly on the same statement handle.
 	if (params.empty()) {
 		retcode = SQLExecDirectWithFallback(stmt, query);
+		if (retcode == SQL_NO_DATA) {
+			return 0;
+		}
 	} else {
 		retcode = SQLPrepareWithFallback(stmt, query);
 	}
@@ -178,6 +189,9 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 
 	retcode = SQLExecute(stmt);
+	if (retcode == SQL_NO_DATA) {
+		return 0;
+	}
 	if (!SQL_SUCCEEDED(retcode)) {
 		ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, GetConn(), "source_execute", query);
 	}

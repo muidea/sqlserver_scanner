@@ -17,6 +17,10 @@ struct ODBCParameter {
 	Value value;
 	SQLSMALLINT buffer_type = SQL_UNKNOWN_TYPE;
 	bool is_unsigned = false;
+	bool use_text_buffer = false;
+	string text_buffer;
+	SQLULEN column_size = 0;
+	SQLSMALLINT decimal_digits = 0;
 
 	vector<char> bind_buffer;
 	SQLLEN bind_length = 0;
