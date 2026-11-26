@@ -53,4 +53,14 @@ if(SCANNER_BUILD_CAPABILITY_TESTS)
     target_include_directories(guarded_odbc_source_error_test PRIVATE src/include)
     target_link_libraries(guarded_odbc_source_error_test duckdb)
     add_test(NAME guarded_odbc_source_errors COMMAND guarded_odbc_source_error_test)
+
+    add_executable(sqlserver_temporal_test
+                   test/sqlserver_temporal_test.cpp
+                   src/odbc_utils.cpp
+                   src/odbc_filter_pushdown.cpp
+                   src/odbc_parameter.cpp
+                   src/odbc_types.cpp)
+    target_include_directories(sqlserver_temporal_test PRIVATE src/include)
+    target_link_libraries(sqlserver_temporal_test duckdb ${ODBC_LIBRARY})
+    add_test(NAME sqlserver_temporal COMMAND sqlserver_temporal_test)
 endif()

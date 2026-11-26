@@ -2,9 +2,20 @@
 
 namespace duckdb {
 
-static bool GetBoolOption(ClientContext &context, const string &name) {
+static bool GetBoolOption(ClientContext &context, const string &name, bool default_val = false) {
 	Value value;
-	return context.TryGetCurrentSetting(Identifier(name), value) && BooleanValue::Get(value);
+	if (context.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
+		return BooleanValue::Get(value);
+	}
+	return default_val;
+}
+
+static bool GetBoolOption(DatabaseInstance &db, const string &name, bool default_val = false) {
+	Value value;
+	if (db.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
+		return BooleanValue::Get(value);
+	}
+	return default_val;
 }
 
 ODBCTypeConfig::ODBCTypeConfig() {
@@ -13,7 +24,13 @@ ODBCTypeConfig::ODBCTypeConfig() {
 ODBCTypeConfig::ODBCTypeConfig(ClientContext &context)
     : bit1_as_boolean(GetBoolOption(context, "sqlserver_bit1_as_boolean")),
       tinyint1_as_boolean(GetBoolOption(context, "sqlserver_tinyint1_as_boolean")),
-      time_as_time(GetBoolOption(context, "sqlserver_time_as_time")) {
+      time_as_time(GetBoolOption(context, "sqlserver_time_as_time", true)) {
+}
+
+ODBCTypeConfig::ODBCTypeConfig(DatabaseInstance &db)
+    : bit1_as_boolean(GetBoolOption(db, "sqlserver_bit1_as_boolean")),
+      tinyint1_as_boolean(GetBoolOption(db, "sqlserver_tinyint1_as_boolean")),
+      time_as_time(GetBoolOption(db, "sqlserver_time_as_time", true)) {
 }
 
 LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &type_info) {
@@ -63,18 +80,20 @@ LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, cons
 		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
 	}
 	if (type_name == "datetimeoffset") {
-		return LogicalType::VARCHAR;
+		return LogicalType::TIMESTAMP_TZ;
 	}
 	if (type_name == "datetime" || type_name == "datetime2" || type_name == "smalldatetime") {
 		return LogicalType::TIMESTAMP;
+	}
+	if (type_name == "uniqueidentifier") {
+		return LogicalType::UUID;
 	}
 	if (type_name == "timestamp" || type_name == "rowversion" || type_name == "binary" || type_name == "varbinary" ||
 	    type_name == "image" || type_name == "longvarbinary") {
 		return LogicalType::BLOB;
 	}
 	if (type_name == "char" || type_name == "varchar" || type_name == "text" || type_name == "nchar" ||
-	    type_name == "nvarchar" || type_name == "ntext" || type_name == "xml" || type_name == "uniqueidentifier" ||
-	    type_name == "sql_variant") {
+	    type_name == "nvarchar" || type_name == "ntext" || type_name == "xml" || type_name == "sql_variant") {
 		return LogicalType::VARCHAR;
 	}
 	return LogicalType::VARCHAR;
@@ -134,6 +153,15 @@ LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQL
 	case SQL_VARBINARY:
 	case SQL_LONGVARBINARY:
 		type_info.type_name = "varbinary";
+		break;
+	case SQL_GUID:
+		type_info.type_name = "uniqueidentifier";
+		break;
+	case -154: // SQL_SS_TIME2
+		type_info.type_name = "time";
+		break;
+	case -155: // SQL_SS_TIMESTAMPOFFSET
+		type_info.type_name = "datetimeoffset";
 		break;
 	default:
 		type_info.type_name = "varchar";

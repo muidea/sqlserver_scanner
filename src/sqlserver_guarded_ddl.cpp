@@ -3,7 +3,9 @@
 //
 // sqlserver_guarded_ddl.cpp
 //
-// Restricted transactional SQL Server DDL and capability introspection.
+// Guarded SQL Server capability observation, catalog description, and
+// transactional DDL execution (v2-v6 ABI, CTAS, conditional source_noop,
+// dependency/widening safety guards, and pre-2005 capability gate).
 //===----------------------------------------------------------------------===//
 
 #include "duckdb.hpp"
@@ -13,6 +15,7 @@
 #include "guarded_odbc_source_error.hpp"
 #include "storage/odbc_catalog.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <codecvt>
@@ -23,6 +26,20 @@
 
 namespace duckdb {
 namespace {
+
+class DDLRejectException : public std::runtime_error {
+public:
+	string sqlstate;
+	string stage;
+	DDLRejectException(string state_p, string stage_p, const string &msg)
+	    : std::runtime_error(msg), sqlstate(std::move(state_p)), stage(std::move(stage_p)) {
+	}
+};
+
+[[noreturn]] static void RejectDDL(const string &sqlstate = "0A000", const string &stage = "source_identity",
+                                   const string &msg = "guarded SQL Server DDL rejected") {
+	throw DDLRejectException(sqlstate, stage, msg);
+}
 
 static bool SimpleIntLiteral(const string &s) {
 	if (s.empty() || s.size() > 38)
@@ -57,19 +74,46 @@ static string NLiteral(const string &s) {
 	return out + "'";
 }
 
+static string SafeSQLServerCollation(const string &s) {
+	if (s.empty() || s.size() > 128) {
+		RejectDDL("0A000", "source_definition", "invalid SQL Server collation name");
+	}
+	for (char c : s) {
+		if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')) {
+			RejectDDL("0A000", "source_definition", "invalid SQL Server collation name");
+		}
+	}
+	return s;
+}
+
 static string JSON(const string &s) {
 	const char *hex = "0123456789abcdef";
 	string out = "\"";
 	for (unsigned char c : s) {
-		if (c == '"' || c == '\\') {
-			out += '\\';
-			out += static_cast<char>(c);
-		} else if (c < 32) {
-			out += "\\u00";
-			out += hex[c >> 4];
-			out += hex[c & 15];
-		} else {
-			out += static_cast<char>(c);
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			if (c < 32) {
+				out += "\\u00";
+				out += hex[c >> 4];
+				out += hex[c & 15];
+			} else {
+				out += static_cast<char>(c);
+			}
 		}
 	}
 	return out + "\"";
@@ -95,6 +139,76 @@ static int MssqlMajorVersion(const string &version) {
 		return std::stoi(version.substr(0, i));
 	} catch (...) {
 		return -1;
+	}
+}
+
+static string ValidSQLState(const string &candidate, const string &fallback) {
+	if (candidate.size() == 5) {
+		bool ok = true;
+		for (char c : candidate) {
+			if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'))) {
+				ok = false;
+				break;
+			}
+		}
+		if (ok) {
+			return candidate;
+		}
+	}
+	return fallback;
+}
+
+static string MapMssqlState(SQLINTEGER native, const string &odbc_state) {
+	switch (native) {
+	case 1222:
+		return "55P03";
+	case 1205:
+		return "40P01";
+	case 515:
+	case 4901:
+		return "23502";
+	case 547:
+		return "23514";
+	case 2601:
+	case 2627:
+	case 1505:
+		return "23505";
+	case 3726:
+	case 4712:
+	case 5074:
+	case 4902:
+	case 4922:
+	case 5072:
+	case 3723:
+		return "2BP01";
+	case 4923:
+		return "42P16";
+	case 2714:
+	case 1913:
+	case 1779:
+	case 1781:
+	case 2705:
+		return "42P07";
+	case 3701:
+	case 3728:
+	case 15248:
+	case 15335:
+		return "42704";
+	case 208:
+	case 1088:
+		return "42P01";
+	case 207:
+	case 4924:
+		return "42703";
+	case 229:
+	case 262:
+	case 15247:
+		return "42501";
+	case 2760:
+	case 3729:
+		return "3F000";
+	default:
+		return ValidSQLState(odbc_state, "HY000");
 	}
 }
 
@@ -149,12 +263,27 @@ static string DefaultLiteralSQL(const string &kind, const string &value) {
 	throw BinderException("DDL default literal is unsupported");
 }
 
+struct DDLColumnDef {
+	string name;
+	string type;
+	int32_t length = 0;
+	int32_t precision = 0;
+	int32_t scale = 0;
+	bool not_null = false;
+	string default_kind;
+	string default_value;
+	bool primary_key = false;
+	bool unique = false;
+	string native_type;
+};
+
 struct DDLIntent {
 	int32_t contract_version = 2;
 	bool conditional = false;
 	string database, schema, operation, action, name, index, owner, new_name, column_name, query_sql, sql;
-	vector<pair<string, string>> column_specs;
+	vector<DDLColumnDef> column_defs;
 	vector<string> columns, constraints, keys;
+	vector<string> table_pk_columns;
 	string default_kind, default_value, constraint_name, constraint_kind, check_column, check_operator, check_value,
 	    reference_schema, reference_table, identity_mode;
 	vector<string> constraint_keys, reference_keys;
@@ -196,7 +325,7 @@ struct DDLIntent {
 			if (type == "real")
 				return "REAL";
 			if (type == "double")
-				return "FLOAT";
+				return "FLOAT(53)";
 			if (type == "boolean")
 				return "BIT";
 			if (type == "text")
@@ -382,6 +511,9 @@ struct DDLIntent {
 				string rs = Text(cv[3]), rt = Text(cv[4]);
 				if (kind == "foreign_key" && rs != d.schema)
 					throw BinderException("DDL foreign key schema must match source schema");
+				if (kind == "primary_key") {
+					d.table_pk_columns.insert(d.table_pk_columns.end(), ck.begin(), ck.end());
+				}
 				auto clause = constraint_clause(kind, ck, rs, rt, rk, Text(cv[6]), Text(cv[7]), Text(cv[8]));
 				d.constraints.push_back(cname.empty() ? clause : "CONSTRAINT " + Quote(cname) + " " + clause);
 			}
@@ -402,19 +534,21 @@ struct DDLIntent {
 			if (ct.size() != expected_fields || ct[0].first != "name" || ct[1].first != "type" ||
 			    ct[2].first != "length" || cv[2].IsNull() || cv[2].type().id() != LogicalTypeId::INTEGER)
 				throw BinderException("DDL column fields are invalid");
-			string n = Text(cv[0]), type = Text(cv[1]);
-			if (!Name(n) || std::find(seen.begin(), seen.end(), n) != seen.end())
+			DDLColumnDef def;
+			def.name = Text(cv[0]);
+			def.type = Text(cv[1]);
+			def.length = cv[2].GetValue<int32_t>();
+			if (!Name(def.name) || std::find(seen.begin(), seen.end(), def.name) != seen.end())
 				throw BinderException("DDL duplicate column is invalid");
-			seen.push_back(n);
-			int32_t prec = 0, scale = 0;
+			seen.push_back(def.name);
 			if (contract >= 5) {
 				if (ct[3].first != "precision" || ct[4].first != "scale" || cv[3].IsNull() || cv[4].IsNull() ||
 				    cv[3].type().id() != LogicalTypeId::INTEGER || cv[4].type().id() != LogicalTypeId::INTEGER)
 					throw BinderException("DDL numeric/time modifiers are invalid");
-				prec = cv[3].GetValue<int32_t>();
-				scale = cv[4].GetValue<int32_t>();
+				def.precision = cv[3].GetValue<int32_t>();
+				def.scale = cv[4].GetValue<int32_t>();
 			}
-			auto native = ColumnType(type, cv[2].GetValue<int32_t>(), prec, scale, contract >= 5);
+			def.native_type = ColumnType(def.type, def.length, def.precision, def.scale, contract >= 5);
 			string extra;
 			if (contract == 6) {
 				if (ct[5].first != "not_null" || ct[6].first != "default_kind" || ct[7].first != "default_value" ||
@@ -422,20 +556,32 @@ struct DDLIntent {
 				    cv[9].IsNull() || cv[5].type().id() != LogicalTypeId::BOOLEAN ||
 				    cv[8].type().id() != LogicalTypeId::BOOLEAN || cv[9].type().id() != LogicalTypeId::BOOLEAN)
 					throw BinderException("DDL v6 column modifiers are invalid");
-				if (cv[5].GetValue<bool>())
-					extra += " NOT NULL";
-				string dk = Text(cv[6]), dv = Text(cv[7]);
-				if (!dk.empty())
-					extra += " DEFAULT (" + DefaultLiteralSQL(dk, dv) + ")";
-				else if (!dv.empty())
+				def.not_null = cv[5].GetValue<bool>();
+				def.default_kind = Text(cv[6]);
+				def.default_value = Text(cv[7]);
+				def.primary_key = cv[8].GetValue<bool>();
+				def.unique = cv[9].GetValue<bool>();
+				if (def.default_kind.empty() && !def.default_value.empty())
 					throw BinderException("DDL column default kind is missing");
-				if (cv[8].GetValue<bool>())
+				bool in_table_pk = std::find(d.table_pk_columns.begin(), d.table_pk_columns.end(), def.name) !=
+				                   d.table_pk_columns.end();
+				bool eff_nn = def.not_null || def.primary_key || in_table_pk;
+				if (eff_nn && def.default_kind == "null")
+					throw BinderException("DDL NOT NULL column cannot have NULL default");
+				extra += eff_nn ? " NOT NULL" : " NULL";
+				if (!def.default_kind.empty())
+					extra += " DEFAULT (" + DefaultLiteralSQL(def.default_kind, def.default_value) + ")";
+				if (def.primary_key)
 					extra += " PRIMARY KEY";
-				if (cv[9].GetValue<bool>())
+				if (def.unique)
 					extra += " UNIQUE";
+			} else {
+				bool in_table_pk = std::find(d.table_pk_columns.begin(), d.table_pk_columns.end(), def.name) !=
+				                   d.table_pk_columns.end();
+				extra += in_table_pk ? " NOT NULL" : " NULL";
 			}
-			d.columns.push_back(Quote(n) + " " + native + extra);
-			d.column_specs.emplace_back(n, native);
+			d.columns.push_back(Quote(def.name) + " " + def.native_type + extra);
+			d.column_defs.push_back(std::move(def));
 		}
 		for (auto &k : keys) {
 			auto n = Text(k);
@@ -495,10 +641,11 @@ struct DDLIntent {
 			d.sql = "EXEC sys.sp_rename @objname=" + NLiteral(target + "." + Quote(d.column_name)) +
 			        ",@newname=" + NLiteral(d.new_name) + ",@objtype=N'COLUMN'";
 		} else if (d.action == "alter_column_type") {
-			if (d.column_specs.size() != 1 || d.column_name.empty() || d.column_specs[0].first != d.column_name)
+			if (d.column_defs.size() != 1 || d.column_name.empty() || d.column_defs[0].name != d.column_name)
 				throw BinderException("DDL alter column type options are invalid");
-			// Nullable suffix is resolved from locked sys.columns in ScanDDL.
-			d.sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(d.column_name) + " " + d.column_specs[0].second;
+			// Lossless widening, collation, default preservation, and nullability resolved in ScanDDL.
+			d.sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(d.column_name) + " " +
+			        d.column_defs[0].native_type;
 		} else if (d.action == "rename_index") {
 			if (!d.columns.empty() || !d.keys.empty() || d.owner.empty() || d.new_name.empty() || d.new_name == d.name)
 				throw BinderException("DDL rename index options are invalid");
@@ -583,7 +730,7 @@ public:
 	DDLSession(ClientContext &ctx_p, SQLHDBC dbc, int seconds) : ctx(ctx_p), stmt(nullptr, ODBCStatementDelete) {
 		SQLHSTMT h = nullptr;
 		if (SQLAllocHandle(SQL_HANDLE_STMT, dbc, &h) != SQL_SUCCESS)
-			throw IOException("SQL Server DDL statement allocation failed");
+			RejectDDL("08006", "source_identity", "SQL Server DDL statement allocation failed");
 		stmt = ODBCStatementPtr(h, ODBCStatementDelete);
 		SQLSetStmtAttr(h, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(static_cast<intptr_t>(seconds)), 0);
 		watcher = std::thread([this, seconds] {
@@ -608,14 +755,56 @@ public:
 		if (watcher.joinable())
 			watcher.join();
 	}
+
 	string sqlstate;
+	string current_stage = "source_identity";
 	SQLINTEGER native_code = 0;
+	int64_t last_warning_count = 0;
 	GuardedODBCSourceError source;
 	std::atomic<bool> cancelled {false};
 
-	bool CheckRC(SQLRETURN rc) {
-		if (SQL_SUCCEEDED(rc))
-			return true;
+	void Check(SQLRETURN rc, bool ignore_sp_rename_info = false) {
+		if (rc == SQL_SUCCESS) {
+			return;
+		}
+		if (rc == SQL_SUCCESS_WITH_INFO && ignore_sp_rename_info) {
+			bool only_benign_15477 = true;
+			SQLINTEGER non_benign_count = 0;
+			for (SQLSMALLINT rec = 1; rec <= 32; rec++) {
+				SQLCHAR state[6] = {0};
+				SQLINTEGER native = 0;
+				SQLSMALLINT len = 0;
+				auto diag_rc = SQLGetDiagRec(SQL_HANDLE_STMT, stmt.get(), rec, state, &native, nullptr, 0, &len);
+				if (diag_rc == SQL_NO_DATA) {
+					break;
+				}
+				if (!SQL_SUCCEEDED(diag_rc)) {
+					only_benign_15477 = false;
+					break;
+				}
+				if (native != 15477) {
+					only_benign_15477 = false;
+					non_benign_count++;
+				}
+			}
+			if (only_benign_15477) {
+				return;
+			}
+			last_warning_count += non_benign_count;
+			return;
+		}
+		if (rc == SQL_SUCCESS_WITH_INFO) {
+			for (SQLSMALLINT rec = 1; rec <= 32; rec++) {
+				SQLCHAR state[6] = {0};
+				SQLINTEGER native = 0;
+				SQLSMALLINT len = 0;
+				if (SQLGetDiagRec(SQL_HANDLE_STMT, stmt.get(), rec, state, &native, nullptr, 0, &len) == SQL_NO_DATA) {
+					break;
+				}
+				last_warning_count++;
+			}
+			return;
+		}
 		source = ReadGuardedODBCSourceError(SQL_HANDLE_STMT, stmt.get(), "sqlserver");
 		SQLCHAR st[6] = {0};
 		SQLSMALLINT len = 0;
@@ -625,104 +814,130 @@ public:
 		} else {
 			sqlstate = MapMssqlState(native_code, st[0] ? string(reinterpret_cast<char *>(st)) : "HY000");
 		}
-		return false;
+		RejectDDL(sqlstate, current_stage, source.message.empty() ? "SQL Server DDL error" : source.message);
 	}
-	static string MapMssqlState(SQLINTEGER code, const string &odbc_state) {
-		switch (code) {
-		case 2714:
-		case 1913:
-			return "42P07";
-		case 208:
-		case 3701:
-		case 3728:
-			return "42P01";
-		case 207:
-		case 4924:
-			return "42703";
-		case 2705:
-			return "42701";
-		case 229:
-		case 262:
-			return "42501";
-		case 2760:
-		case 3729:
-			return "3F000";
-		case 2601:
-		case 2627:
-		case 1505:
-			return "23505";
-		case 547:
-			return "23503";
-		case 515:
-			return "23502";
-		case 1205:
-			return "40P01";
-		case 1222:
-			return "55P03";
-		default:
-			return odbc_state.size() == 5 ? odbc_state : "HY000";
+
+	void Start(bool cleanup = false) {
+		if (!cleanup && (cancelled.load() || ctx.IsInterrupted())) {
+			RejectDDL("57014", current_stage, "operation cancelled");
 		}
+		auto rc1 = SQLFreeStmt(stmt.get(), SQL_CLOSE);
+		if (!cleanup)
+			Check(rc1);
+		auto rc2 = SQLFreeStmt(stmt.get(), SQL_UNBIND);
+		if (!cleanup)
+			Check(rc2);
+		auto rc3 = SQLFreeStmt(stmt.get(), SQL_RESET_PARAMS);
+		if (!cleanup)
+			Check(rc3);
 	}
+
 	vector<vector<string>> Query(const string &sql, const vector<string> &params = {}) {
-		SQLFreeStmt(stmt.get(), SQL_CLOSE);
-		SQLFreeStmt(stmt.get(), SQL_RESET_PARAMS);
+		Start(false);
 		auto wsql = ToWide(sql);
-		if (!CheckRC(SQLPrepareW(stmt.get(), wsql.data(), static_cast<SQLINTEGER>(wsql.size() - 1))))
-			throw IOException("SQL Server DDL query prepare failed");
-		vector<std::vector<SQLWCHAR>> wparams(params.size());
-		vector<SQLLEN> lens(params.size(), 0);
-		for (idx_t i = 0; i < params.size(); i++) {
-			wparams[i] = ToWide(params[i]);
-			lens[i] = (wparams[i].size() - 1) * sizeof(SQLWCHAR);
-			if (!CheckRC(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
-			                              std::max<size_t>(1, wparams[i].size() - 1), 0, wparams[i].data(),
-			                              wparams[i].size() * sizeof(SQLWCHAR), &lens[i])))
-				throw IOException("SQL Server DDL query bind failed");
+		if (params.empty()) {
+			Check(SQLExecDirectW(stmt.get(), wsql.data(), static_cast<SQLINTEGER>(wsql.size() - 1)));
+		} else {
+			Check(SQLPrepareW(stmt.get(), wsql.data(), static_cast<SQLINTEGER>(wsql.size() - 1)));
+			vector<std::vector<SQLWCHAR>> wparams(params.size());
+			vector<SQLLEN> lens(params.size(), 0);
+			for (idx_t i = 0; i < params.size(); i++) {
+				wparams[i] = ToWide(params[i]);
+				lens[i] = (wparams[i].size() - 1) * sizeof(SQLWCHAR);
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+				                       std::max<size_t>(1, wparams[i].size() - 1), 0, wparams[i].data(),
+				                       wparams[i].size() * sizeof(SQLWCHAR), &lens[i]));
+			}
+			Check(SQLExecute(stmt.get()));
 		}
-		if (!CheckRC(SQLExecute(stmt.get())))
-			throw IOException("SQL Server DDL query failed");
 		SQLSMALLINT ncols = 0;
-		if (!CheckRC(SQLNumResultCols(stmt.get(), &ncols)))
-			throw IOException("SQL Server DDL column count failed");
+		Check(SQLNumResultCols(stmt.get(), &ncols));
+		if (ncols < 1 || ncols > 64) {
+			RejectDDL("XX000", current_stage, "unexpected column count in SQL Server query");
+		}
 		vector<vector<string>> rows;
+		idx_t total_bytes = 0;
 		while (true) {
 			auto rc = SQLFetch(stmt.get());
 			if (rc == SQL_NO_DATA)
 				break;
-			if (!CheckRC(rc))
-				throw IOException("SQL Server DDL fetch failed");
+			Check(rc);
+			if (rows.size() >= 8192) {
+				RejectDDL("54000", current_stage, "SQL Server metadata row bound exceeded");
+			}
 			vector<string> row;
 			row.reserve(ncols);
 			for (SQLSMALLINT c = 1; c <= ncols; c++) {
-				SQLCHAR buf[4096] = {};
+				char buf[8192] = {};
 				SQLLEN ind = 0;
 				auto grc = SQLGetData(stmt.get(), c, SQL_C_CHAR, buf, sizeof(buf), &ind);
-				if (!CheckRC(grc))
-					throw IOException("SQL Server DDL cell read failed");
-				row.emplace_back(ind == SQL_NULL_DATA ? string() : string(reinterpret_cast<char *>(buf)));
+				if (grc != SQL_SUCCESS) {
+					Check(grc);
+				}
+				if (ind == SQL_NULL_DATA) {
+					row.emplace_back("");
+				} else if (ind < 0 || static_cast<idx_t>(ind) >= sizeof(buf)) {
+					RejectDDL("54000", current_stage, "SQL Server metadata cell bound exceeded");
+				} else {
+					row.emplace_back(buf, static_cast<size_t>(ind));
+				}
+				total_bytes += row.back().size();
+				if (total_bytes > 1024 * 1024) {
+					RejectDDL("54000", current_stage, "SQL Server metadata document bound exceeded");
+				}
 			}
 			rows.push_back(std::move(row));
 		}
+		SQLRETURN more_rc;
+		while ((more_rc = SQLMoreResults(stmt.get())) != SQL_NO_DATA) {
+			Check(more_rc);
+		}
 		return rows;
 	}
-	string Scalar(const string &sql, const vector<string> &params = {}) {
+
+	string Scalar(const string &sql, const vector<string> &params = {}, bool cleanup = false) {
+		if (cleanup) {
+			Start(true);
+			auto wsql = ToWide(sql);
+			if (!SQL_SUCCEEDED(SQLExecDirectW(stmt.get(), wsql.data(), static_cast<SQLINTEGER>(wsql.size() - 1)))) {
+				return "";
+			}
+			if (!SQL_SUCCEEDED(SQLFetch(stmt.get()))) {
+				return "";
+			}
+			char buf[256] = {0};
+			SQLLEN ind = 0;
+			if (!SQL_SUCCEEDED(SQLGetData(stmt.get(), 1, SQL_C_CHAR, buf, sizeof(buf), &ind)) || ind == SQL_NULL_DATA ||
+			    ind < 0) {
+				return "";
+			}
+			return string(buf, static_cast<size_t>(ind));
+		}
 		auto r = Query(sql, params);
 		if (r.size() != 1 || r[0].size() != 1)
-			throw IOException("SQL Server DDL scalar unavailable");
+			RejectDDL("XX000", current_stage, "SQL Server DDL scalar unavailable");
 		return r[0][0];
 	}
-	void Exec(const string &sql) {
-		SQLFreeStmt(stmt.get(), SQL_CLOSE);
-		SQLFreeStmt(stmt.get(), SQL_RESET_PARAMS);
+
+	void Exec(const string &sql, bool cleanup = false, bool ignore_sp_rename_info = false) {
+		Start(cleanup);
 		auto wsql = ToWide(sql);
-		if (!CheckRC(SQLExecDirectW(stmt.get(), wsql.data(), static_cast<SQLINTEGER>(wsql.size() - 1))))
-			throw IOException("SQL Server DDL execution failed");
-	}
-	bool TryExec(const string &sql) {
-		SQLFreeStmt(stmt.get(), SQL_CLOSE);
-		SQLFreeStmt(stmt.get(), SQL_RESET_PARAMS);
-		auto wsql = ToWide(sql);
-		return SQL_SUCCEEDED(SQLExecDirectW(stmt.get(), wsql.data(), static_cast<SQLINTEGER>(wsql.size() - 1)));
+		auto rc = SQLExecDirectW(stmt.get(), wsql.data(), static_cast<SQLINTEGER>(wsql.size() - 1));
+		if (cleanup) {
+			return;
+		}
+		if (rc == SQL_NO_DATA) {
+			return;
+		}
+		Check(rc, ignore_sp_rename_info);
+		while ((rc = SQLMoreResults(stmt.get())) != SQL_NO_DATA) {
+			if (!SQL_SUCCEEDED(rc)) {
+				Check(rc, ignore_sp_rename_info);
+			}
+			if (rc == SQL_SUCCESS_WITH_INFO) {
+				Check(rc, ignore_sp_rename_info);
+			}
+		}
 	}
 
 private:
@@ -734,6 +949,21 @@ private:
 	std::thread watcher;
 };
 
+struct SQLServerServerFacts {
+	string version;
+	string machine;
+	string instance;
+	string db_name;
+	string db_id;
+	string updateability;
+	string login;
+	string db_user;
+	string schema_id;
+	bool read_only = false;
+	bool ns_present = false;
+	bool executor_available = false;
+};
+
 static bool VerifyMssqlIdentity(DDLSession &s, string &version, string &db_name) {
 	if (s.Scalar("SELECT CASE WHEN @@VERSION LIKE 'Microsoft SQL Server%' THEN '1' ELSE '0' END") != "1")
 		return false;
@@ -742,27 +972,104 @@ static bool VerifyMssqlIdentity(DDLSession &s, string &version, string &db_name)
 	return !version.empty() && !db_name.empty();
 }
 
-static string FormatMssqlColumnType(const string &type_name, int max_len, int prec, int scale) {
-	auto t = StringUtil::Lower(type_name);
-	if (t == "varchar" || t == "char" || t == "varbinary" || t == "binary") {
-		return StringUtil::Upper(t) + "(" + (max_len == -1 ? "MAX" : std::to_string(max_len)) + ")";
+static SQLServerServerFacts QueryServerFacts(DDLSession &s, const string &schema) {
+	string version, db_name;
+	if (!VerifyMssqlIdentity(s, version, db_name)) {
+		RejectDDL("0A000", "source_identity", "SQL Server DDL identity not certified");
 	}
-	if (t == "nvarchar" || t == "nchar") {
-		return StringUtil::Upper(t) + "(" + (max_len == -1 ? "MAX" : std::to_string(max_len / 2)) + ")";
+	SQLServerServerFacts facts;
+	facts.version = version;
+	facts.db_name = db_name;
+	const int major = MssqlMajorVersion(version);
+	facts.executor_available = major >= 9;
+
+	if (facts.executor_available) {
+		auto rows = s.Query(
+		    "SELECT "
+		    "COALESCE(CAST(SERVERPROPERTY('MachineName') AS varchar(128)),''),"
+		    "COALESCE(CAST(SERVERPROPERTY('InstanceName') AS varchar(128)),'MSSQLSERVER'),"
+		    "COALESCE(CONVERT(varchar(20),DB_ID()),''),"
+		    "COALESCE(CAST(DATABASEPROPERTYEX(DB_NAME(),'Updateability') AS varchar(64)),''),"
+		    "COALESCE(CAST(SUSER_SNAME() AS varchar(128)),''),"
+		    "COALESCE(CAST(USER_NAME() AS varchar(128)),''),"
+		    "COALESCE(CONVERT(varchar(20),SCHEMA_ID(?)),''),"
+		    "COALESCE((SELECT CONVERT(varchar(1),is_read_only) FROM sys.databases WHERE name=DB_NAME()),'0')",
+		    {schema});
+		if (rows.size() != 1 || rows[0].size() != 8) {
+			RejectDDL("0A000", "source_identity", "SQL Server identity query failed");
+		}
+		facts.machine = rows[0][0];
+		facts.instance = rows[0][1];
+		facts.db_id = rows[0][2];
+		facts.updateability = rows[0][3];
+		facts.login = rows[0][4];
+		facts.db_user = rows[0][5];
+		facts.schema_id = rows[0][6];
+		facts.ns_present = !facts.schema_id.empty();
+		facts.read_only = (StringUtil::Upper(facts.updateability) != "READ_WRITE" || rows[0][7] == "1");
+	} else {
+		facts.updateability =
+		    s.Scalar("SELECT COALESCE(CAST(DATABASEPROPERTYEX(DB_NAME(),'Updateability') AS varchar(64)),'')");
+		facts.read_only = StringUtil::Upper(facts.updateability) == "READ_ONLY";
+		facts.ns_present =
+		    s.Scalar("SELECT CASE WHEN EXISTS (SELECT 1 FROM dbo.sysusers WHERE name=?) THEN '1' ELSE '0' END",
+		             {schema}) == "1";
 	}
-	if (t == "decimal" || t == "numeric") {
-		return StringUtil::Upper(t) + "(" + std::to_string(prec) + "," + std::to_string(scale) + ")";
-	}
-	if (t == "datetime2" || t == "datetimeoffset" || t == "time") {
-		return StringUtil::Upper(t) + "(" + std::to_string(scale) + ")";
-	}
-	return StringUtil::Upper(t);
+	return facts;
 }
 
-struct CapData : TableFunctionData {
+static string BuildSQLServerAlterColumnType(const vector<string> &row) {
+	// row: {ty.name, max_length, precision, scale, collation_name, is_computed, is_identity, is_nullable,
+	//       is_user_defined}
+	const string ty = StringUtil::Lower(row[0]);
+	int max_len = std::stoi(row[1]);
+	int prec = std::stoi(row[2]);
+	int scale = std::stoi(row[3]);
+	const string collation = row[4];
+	if (row[5] == "1" || row[6] == "1" || row[8] == "1") {
+		RejectDDL("0A000", "source_definition", "cannot alter computed, identity, or user-defined column");
+	}
+	if (ty == "bit" || ty == "tinyint" || ty == "smallint" || ty == "int" || ty == "bigint" || ty == "real" ||
+	    ty == "date" || ty == "uniqueidentifier" || ty == "datetime" || ty == "smalldatetime" || ty == "money" ||
+	    ty == "smallmoney") {
+		return ty;
+	}
+	if (ty == "float") {
+		return "float(" + std::to_string(prec > 0 ? prec : 53) + ")";
+	}
+	if (ty == "decimal" || ty == "numeric") {
+		return ty + "(" + std::to_string(prec) + "," + std::to_string(scale) + ")";
+	}
+	if (ty == "time" || ty == "datetime2" || ty == "datetimeoffset") {
+		return ty + "(" + std::to_string(scale) + ")";
+	}
+	if (ty == "varbinary" || ty == "binary") {
+		if (max_len == -1) {
+			return ty + "(MAX)";
+		}
+		return ty + "(" + std::to_string(max_len) + ")";
+	}
+	if (ty == "varchar" || ty == "char" || ty == "nvarchar" || ty == "nchar") {
+		int char_len = max_len;
+		if (max_len != -1 && (ty == "nvarchar" || ty == "nchar")) {
+			char_len = max_len / 2;
+		}
+		string res = ty + "(" + (max_len == -1 ? string("MAX") : std::to_string(char_len)) + ")";
+		if (!collation.empty()) {
+			res += " COLLATE " + SafeSQLServerCollation(collation);
+		}
+		return res;
+	}
+	RejectDDL("0A000", "source_definition", "unsupported column type for NULL/NOT NULL change");
+}
+
+struct DDLMetaData : TableFunctionData {
 	ODBCCatalog &catalog;
 	string schema;
-	explicit CapData(ODBCCatalog &c) : catalog(c) {
+	string kind;
+	string name;
+	bool describe = false;
+	DDLMetaData(ODBCCatalog &c, bool d) : catalog(c), describe(d) {
 	}
 };
 
@@ -782,82 +1089,197 @@ static unique_ptr<GlobalTableFunctionState> InitOne(ClientContext &, TableFuncti
 	return make_uniq<OneRowState>();
 }
 
-static unique_ptr<FunctionData> BindCapabilities(ClientContext &ctx, TableFunctionBindInput &in,
-                                                 vector<LogicalType> &types, vector<Identifier> &names) {
-	if (in.inputs.size() != 2 || in.inputs[0].IsNull() || in.inputs[1].IsNull())
-		throw BinderException("SQL Server DDL capability input is incomplete");
-	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, Identifier(in.inputs[0].GetValue<string>()));
+static unique_ptr<FunctionData> BindMetadata(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
+                                             vector<duckdb::Identifier> &names) {
+	if ((in.inputs.size() != 2 && in.inputs.size() != 4) || in.inputs[0].IsNull() || in.inputs[1].IsNull())
+		throw BinderException("SQL Server DDL metadata input is incomplete");
+	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, duckdb::Identifier(in.inputs[0].GetValue<string>()));
 	if (!db || db->GetCatalog().GetCatalogType() != "sqlserver")
 		throw BinderException("SQL Server DDL catalog is unavailable");
-	auto d = make_uniq<CapData>(db->GetCatalog().Cast<ODBCCatalog>());
+	bool describe = in.inputs.size() == 4;
+	auto d = make_uniq<DDLMetaData>(db->GetCatalog().Cast<ODBCCatalog>(), describe);
 	d->schema = in.inputs[1].GetValue<string>();
 	if (!DDLIntent::Name(d->schema))
 		throw BinderException("SQL Server DDL schema name is invalid");
+	if (describe) {
+		if (in.inputs[2].IsNull() || in.inputs[3].IsNull())
+			throw BinderException("SQL Server DDL describe input is incomplete");
+		d->kind = in.inputs[2].GetValue<string>();
+		d->name = in.inputs[3].GetValue<string>();
+		if ((d->kind != "table" && d->kind != "index") || !DDLIntent::Name(d->name))
+			throw BinderException("SQL Server DDL describe target is invalid");
+	}
 	names = {"sqlstate", "stage", "document"};
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	return std::move(d);
 }
 
-static void ScanCapabilities(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
+static void ScanMetadata(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	auto &state = in.global_state->Cast<OneRowState>();
 	if (state.done)
 		return;
 	state.done = true;
-	auto &d = in.bind_data->Cast<CapData>();
+	auto &d = in.bind_data->Cast<DDLMetaData>();
 	string sqlstate, stage = "source_identity", document;
 	ODBCPoolConnection pooled;
 	shared_ptr<ODBCConnection> connection;
 	unique_ptr<DDLSession> session;
 	try {
 		if (ctx.IsInterrupted())
-			throw InterruptException();
+			RejectDDL("57014", "source_identity", "interrupted");
 		if (!d.catalog.GetConnectionPool().TryGetConnection(pooled))
-			throw IOException("SQL Server connection unavailable");
+			RejectDDL("08006", "source_identity", "SQL Server connection unavailable");
 		connection = pooled.GetConnection();
 		auto dbc = connection->GetConn();
 		session = make_uniq<DDLSession>(ctx, dbc, 10);
-		string version, db_name;
-		if (!VerifyMssqlIdentity(*session, version, db_name)) {
-			sqlstate = "0A000";
-			throw IOException("SQL Server DDL identity not certified");
-		}
-		stage = "source_metadata";
-		const int major = MssqlMajorVersion(version);
-		const bool executor_available = major >= 9;
-		bool read_only = false;
-		bool ns_present = false;
-		if (executor_available) {
-			read_only =
-			    session->Scalar("SELECT CASE WHEN DATABASEPROPERTYEX(DB_NAME(),'Updateability')='READ_ONLY' OR "
-			                    "is_read_only=1 THEN '1' ELSE '0' END FROM sys.databases WHERE name=DB_NAME()") == "1";
-			ns_present =
-			    session->Scalar("SELECT CASE WHEN SCHEMA_ID(?) IS NOT NULL THEN '1' ELSE '0' END", {d.schema}) == "1";
+		auto &s = *session;
+		auto facts = QueryServerFacts(s, d.schema);
+		string server_id = facts.machine.empty() ? string() : (facts.machine + ":" + facts.instance);
+
+		if (!d.describe) {
+			document = string("{") + "\"contract_version\":1,\"product\":\"sqlserver\",\"source_version\":" +
+			           JSON(facts.version) + ",\"database\":" + JSON(facts.db_name) +
+			           ",\"database_identity\":" + JSON(facts.db_id) + ",\"server_identity\":" + JSON(server_id) +
+			           ",\"schema\":" + JSON(d.schema) + ",\"namespace_identity\":" + JSON(facts.schema_id) +
+			           ",\"namespace_present\":" + (facts.ns_present ? "true" : "false") +
+			           ",\"source_read_only\":" + (facts.read_only ? "true" : "false") +
+			           ",\"session_identity\":{\"login\":" + JSON(facts.login) + ",\"user\":" + JSON(facts.db_user) +
+			           "},\"visibility\":\"CATALOG_READ\",\"executor_available\":" +
+			           (facts.executor_available ? "true" : "false") + ",\"identity_protection\":\"UNVERIFIED\"}";
 		} else {
-			read_only =
-			    session->Scalar("SELECT CASE WHEN DATABASEPROPERTYEX(DB_NAME(),'Updateability')='READ_ONLY' THEN '1' "
-			                    "ELSE '0' END") == "1";
-			ns_present =
-			    session->Scalar("SELECT CASE WHEN EXISTS (SELECT 1 FROM dbo.sysusers WHERE name=?) THEN '1' ELSE '0' "
-			                    "END",
-			                    {d.schema}) == "1";
+			if (!facts.executor_available) {
+				RejectDDL("0A000", "source_identity", "SQL Server < 2005 guarded DDL describe is unsupported");
+			}
+			stage = "source_metadata";
+			s.current_stage = "source_metadata";
+			string presence = "ABSENT";
+			string object_identity, observed_kind, owning_table, table_identity;
+			string cols_json = "[]", indexes_json = "[]", constraints_json = "[]";
+			if (facts.ns_present && d.kind == "table") {
+				auto objs = s.Query(
+				    "SELECT CONVERT(varchar(20),o.object_id),o.type FROM sys.objects o "
+				    "JOIN sys.schemas s ON s.schema_id=o.schema_id "
+				    "WHERE s.name=? AND o.name=? AND o.is_ms_shipped=0 AND o.type IN ('U','V')",
+				    {d.schema, d.name});
+				if (objs.size() == 1) {
+					presence = "PRESENT";
+					object_identity = objs[0][0];
+					observed_kind = objs[0][1] == "V" ? "v" : "r";
+					auto col_rows = s.Query(
+					    "SELECT CONVERT(varchar(20),c.column_id),c.name,ty.name,"
+					    "CONVERT(varchar(20),c.max_length),CONVERT(varchar(20),c.[precision]),"
+					    "CONVERT(varchar(20),c.[scale]),CONVERT(varchar(5),c.is_nullable),"
+					    "COALESCE(dc.name,''),COALESCE(dc.definition,'') "
+					    "FROM sys.columns c JOIN sys.types ty ON ty.user_type_id=c.user_type_id "
+					    "LEFT JOIN sys.default_constraints dc ON dc.object_id=c.default_object_id "
+					    "WHERE c.object_id=" +
+					    object_identity + " ORDER BY c.column_id");
+					cols_json = "[";
+					for (idx_t idx = 0; idx < col_rows.size() && idx < 256; idx++) {
+						if (idx > 0)
+							cols_json += ",";
+						auto &r = col_rows[idx];
+						cols_json += "{\"ordinal\":" + r[0] + ",\"name\":" + JSON(r[1]) + ",\"type\":" + JSON(r[2]) +
+						             ",\"max_length\":" + r[3] + ",\"precision\":" + r[4] + ",\"scale\":" + r[5] +
+						             ",\"nullable\":" + (r[6] == "1" ? "true" : "false") +
+						             ",\"default_name\":" + JSON(r[7]) + ",\"default\":" + JSON(r[8]) + "}";
+					}
+					cols_json += "]";
+
+					auto idx_rows = s.Query(
+					    "SELECT CONVERT(varchar(20),i.index_id),i.name,i.type_desc,"
+					    "CONVERT(varchar(5),i.is_unique),CONVERT(varchar(5),i.is_primary_key) "
+					    "FROM sys.indexes i WHERE i.object_id=" +
+					    object_identity + " AND i.index_id>0 ORDER BY i.index_id");
+					indexes_json = "[";
+					for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+						if (idx > 0)
+							indexes_json += ",";
+						auto &r = idx_rows[idx];
+						indexes_json += "{\"table\":" + JSON(d.name) + ",\"name\":" + JSON(r[1]) +
+						                ",\"type\":" + JSON(r[2]) +
+						                ",\"unique\":" + (r[3] == "1" ? "true" : "false") +
+						                ",\"primary\":" + (r[4] == "1" ? "true" : "false") + "}";
+					}
+					indexes_json += "]";
+
+					auto con_rows = s.Query(
+					    "SELECT kc.name,kc.type FROM sys.key_constraints kc WHERE kc.parent_object_id=" +
+					    object_identity +
+					    " UNION ALL SELECT fk.name,'F' FROM sys.foreign_keys fk WHERE fk.parent_object_id=" +
+					    object_identity +
+					    " UNION ALL SELECT ch.name,'C' FROM sys.check_constraints ch WHERE ch.parent_object_id=" +
+					    object_identity + " ORDER BY 1");
+					constraints_json = "[";
+					for (idx_t idx = 0; idx < con_rows.size() && idx < 256; idx++) {
+						if (idx > 0)
+							constraints_json += ",";
+						constraints_json +=
+						    "{\"name\":" + JSON(con_rows[idx][0]) + ",\"type\":" + JSON(con_rows[idx][1]) + "}";
+					}
+					constraints_json += "]";
+				}
+			} else if (facts.ns_present && d.kind == "index") {
+				auto idx_rows = s.Query(
+				    "SELECT CONVERT(varchar(20),t.object_id),t.name,CONVERT(varchar(20),i.index_id),"
+				    "i.name,CONVERT(varchar(5),i.is_unique),CONVERT(varchar(5),i.is_primary_key) "
+				    "FROM sys.indexes i JOIN sys.tables t ON t.object_id=i.object_id "
+				    "JOIN sys.schemas s ON s.schema_id=t.schema_id "
+				    "WHERE s.name=? AND i.name=? AND t.is_ms_shipped=0 AND i.index_id>0 ORDER BY t.name,i.index_id",
+				    {d.schema, d.name});
+				indexes_json = "[";
+				for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+					if (idx > 0)
+						indexes_json += ",";
+					auto &r = idx_rows[idx];
+					indexes_json += "{\"table\":" + JSON(r[1]) + ",\"name\":" + JSON(r[3]) +
+					                ",\"unique\":" + (r[4] == "1" ? "true" : "false") +
+					                ",\"primary\":" + (r[5] == "1" ? "true" : "false") + "}";
+				}
+				indexes_json += "]";
+				if (idx_rows.size() == 1) {
+					presence = "PRESENT";
+					table_identity = idx_rows[0][0];
+					owning_table = idx_rows[0][1];
+					object_identity = idx_rows[0][0] + ":" + idx_rows[0][2];
+					observed_kind = "i";
+				} else if (idx_rows.size() > 1) {
+					presence = "UNKNOWN";
+				}
+			}
+			document = string("{") + "\"contract_version\":1,\"product\":\"sqlserver\",\"source_version\":" +
+			           JSON(facts.version) + ",\"database\":" + JSON(facts.db_name) +
+			           ",\"database_identity\":" + JSON(facts.db_id) + ",\"server_identity\":" + JSON(server_id) +
+			           ",\"schema\":" + JSON(d.schema) + ",\"name\":" + JSON(d.name) + ",\"kind\":" + JSON(d.kind) +
+			           ",\"namespace_identity\":" + JSON(facts.schema_id) +
+			           ",\"namespace_present\":" + (facts.ns_present ? "true" : "false") +
+			           ",\"presence\":" + JSON(presence) + ",\"object_identity\":" + JSON(object_identity);
+			if (!observed_kind.empty()) {
+				document += ",\"observed_kind\":" + JSON(observed_kind);
+			}
+			if (!owning_table.empty()) {
+				document += ",\"owning_table\":" + JSON(owning_table);
+			}
+			if (!table_identity.empty()) {
+				document += ",\"table_identity\":" + JSON(table_identity);
+			}
+			document += ",\"metadata_complete\":false,\"identity_protection\":\"UNVERIFIED\",\"columns\":" + cols_json +
+			            ",\"indexes\":" + indexes_json + ",\"constraints\":" + constraints_json + "}";
 		}
-		document = "{\"contract_version\":1,\"product\":\"sqlserver\",\"source_version\":" + JSON(version) +
-		           ",\"database\":" + JSON(db_name) + ",\"schema\":" + JSON(d.schema) +
-		           ",\"namespace_present\":" + (ns_present ? "true" : "false") +
-		           ",\"source_read_only\":" + (read_only ? "true" : "false") +
-		           ",\"visibility\":\"CATALOG_READ\",\"executor_available\":" +
-		           (executor_available ? "true" : "false") + "}";
 		stage.clear();
-	} catch (...) {
-		if (sqlstate.empty()) {
-			sqlstate = session && !session->sqlstate.empty()
-			               ? session->sqlstate
-			               : (ctx.IsInterrupted() ? "57014" : "08006");
-		}
+	} catch (const DDLRejectException &rej) {
+		sqlstate = ValidSQLState(rej.sqlstate, "HY000");
+		stage = rej.stage;
 		document.clear();
-		if (connection)
-			connection->Close();
+	} catch (...) {
+		sqlstate = session && !session->sqlstate.empty()
+		               ? session->sqlstate
+		               : (ctx.IsInterrupted() ? "57014" : "08006");
+		document.clear();
 	}
+	session.reset();
+	if (connection)
+		connection->Close();
 	out.SetValue(0, 0, Value(sqlstate));
 	out.SetValue(1, 0, Value(stage));
 	out.SetValue(2, 0, Value(document));
@@ -865,12 +1287,12 @@ static void ScanCapabilities(ClientContext &ctx, TableFunctionInput &in, DataChu
 }
 
 static unique_ptr<FunctionData> BindDDL(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                        vector<Identifier> &names) {
+                                        vector<duckdb::Identifier> &names) {
 	auto cond_it = in.named_parameters.find("conditional");
 	const bool conditional = cond_it != in.named_parameters.end() && !cond_it->second.IsNull() &&
 	                         cond_it->second.GetValue<bool>();
 	auto intent = DDLIntent::Bind(in.inputs, conditional);
-	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, Identifier(DDLIntent::Text(in.inputs[0])));
+	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, duckdb::Identifier(DDLIntent::Text(in.inputs[0])));
 	if (!db || db->GetCatalog().GetCatalogType() != "sqlserver")
 		throw BinderException("SQL Server DDL catalog is unavailable");
 	auto d = make_uniq<DDLData>(db->GetCatalog().Cast<ODBCCatalog>(), std::move(intent));
@@ -892,194 +1314,578 @@ static void ScanDDL(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) 
 		return;
 	state.done = true;
 	auto &d = in.bind_data->Cast<DDLData>();
-	string status = "CONFIRMED_NOT_EXECUTED", error, stage = "source_identity";
-	GuardedODBCSourceError source;
+	const auto &i = d.intent;
+	string status = "CONFIRMED_NOT_EXECUTED", error = "0A000", stage = "source_identity";
+	int64_t warnings = 0;
+	string source_error;
 	ODBCPoolConnection pooled;
 	shared_ptr<ODBCConnection> connection;
 	unique_ptr<DDLSession> session;
 	bool in_tx = false, sent = false, commit_sent = false;
 	try {
 		if (ctx.IsInterrupted()) {
-			error = "57014";
-			throw InterruptException();
+			RejectDDL("57014", "source_identity", "operation cancelled");
 		}
 		if (!d.catalog.GetConnectionPool().TryGetConnection(pooled)) {
-			error = "08006";
-			throw IOException("SQL Server connection unavailable");
+			RejectDDL("08006", "source_identity", "SQL Server connection unavailable");
 		}
 		connection = pooled.GetConnection();
 		auto dbc = connection->GetConn();
-		session = make_uniq<DDLSession>(ctx, dbc, d.intent.action == "reindex" ? 290 : 60);
-		if (session->Scalar("SELECT CONVERT(varchar(20),@@TRANCOUNT)") != "0") {
-			error = "HY000";
-			throw IOException("SQL Server DDL connection is not idle");
+		session = make_uniq<DDLSession>(ctx, dbc, i.action == "reindex" ? 290 : 30);
+		auto &s = *session;
+		if (s.Scalar("SELECT CONVERT(varchar(20),@@TRANCOUNT)") != "0") {
+			RejectDDL("HY000", "source_identity", "SQL Server DDL connection is not idle");
 		}
-		string version, db_name;
-		if (!VerifyMssqlIdentity(*session, version, db_name) || db_name != d.intent.database) {
-			error = "0A000";
-			throw IOException("SQL Server DDL identity not certified");
+		auto facts = QueryServerFacts(s, i.schema);
+		if (facts.db_name != i.database) {
+			RejectDDL("0A000", "source_identity", "SQL Server DDL database identity mismatch");
 		}
-		if (MssqlMajorVersion(version) < 9) {
-			error = "0A000";
-			throw IOException("SQL Server < 2005 guarded DDL is unsupported");
+		if (!facts.executor_available) {
+			RejectDDL("0A000", "source_identity", "SQL Server < 2005 guarded DDL is unsupported");
 		}
-		if (session->Scalar("SELECT CASE WHEN DATABASEPROPERTYEX(DB_NAME(),'Updateability')='READ_ONLY' OR "
-		                    "is_read_only=1 THEN '1' ELSE '0' END FROM sys.databases WHERE name=DB_NAME()") == "1") {
-			error = "25006";
-			throw IOException("SQL Server DDL source is read-only");
+		if (facts.read_only) {
+			RejectDDL("25006", "source_identity", "SQL Server DDL source is read-only");
 		}
-		session->Exec("SET XACT_ABORT ON;SET NOCOUNT ON;SET QUOTED_IDENTIFIER ON;SET ANSI_NULLS ON;SET LOCK_TIMEOUT "
-		              "5000;BEGIN TRANSACTION");
+		if (!facts.ns_present && i.action != "create_schema" && i.action != "drop_schema") {
+			RejectDDL("3F000", "source_definition", "target schema does not exist");
+		}
+
+		// Session safety settings + short lock timeout (2000ms) so DDL fails fast when online traffic holds locks.
+		s.Exec("SET DATEFORMAT ymd;SET XACT_ABORT ON;SET NOCOUNT OFF;SET ANSI_NULLS ON;SET QUOTED_IDENTIFIER ON;"
+		       "SET ANSI_WARNINGS ON;SET ARITHABORT ON;SET NUMERIC_ROUNDABORT OFF;SET LOCK_TIMEOUT 2000;"
+		       "BEGIN TRANSACTION");
 		in_tx = true;
 
-		const auto target = Quote(d.intent.schema) + "." + Quote(d.intent.name);
-		bool idempotent_skip = false;
-		if (d.intent.conditional) {
-			auto count_query = [&](const string &sql, const vector<string> &params) -> bool {
-				auto r = session->Query(sql, params);
-				return r.size() == 1 && !r[0].empty() && r[0][0] != "0";
-			};
-			if (d.intent.action == "create_table" || d.intent.action == "create_table_as") {
-				idempotent_skip = count_query(
-				    "SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE "
-				    "s.name=? AND t.name=?",
-				    {d.intent.schema, d.intent.name});
-			} else if (d.intent.action == "drop_table") {
-				idempotent_skip = !count_query(
-				    "SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE "
-				    "s.name=? AND t.name=?",
-				    {d.intent.schema, d.intent.name});
-			} else if (d.intent.action == "create_schema") {
-				idempotent_skip = count_query("SELECT COUNT(*) FROM sys.schemas WHERE name=?", {d.intent.name});
-			} else if (d.intent.action == "drop_schema") {
-				idempotent_skip = !count_query("SELECT COUNT(*) FROM sys.schemas WHERE name=?", {d.intent.name});
-			} else if (d.intent.action == "add_column" || d.intent.action == "drop_column") {
-				if (count_query(
-				        "SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE "
-				        "s.name=? AND t.name=?",
-				        {d.intent.schema, d.intent.name})) {
-					const auto &cname = d.intent.action == "add_column" ? d.intent.column_specs[0].first
-					                                                    : d.intent.column_name;
-					bool col_present = count_query(
-					    "SELECT COUNT(*) FROM sys.columns WHERE object_id=OBJECT_ID(?,N'U') AND name=?",
-					    {target, cname});
-					idempotent_skip = d.intent.action == "add_column" ? col_present : !col_present;
+		stage = "source_definition";
+		s.current_stage = "source_definition";
+		const string target = Quote(i.schema) + "." + Quote(i.name);
+		auto obj_id_of = [&](const string &obj_name) {
+			return s.Scalar("SELECT COALESCE(CONVERT(varchar(20),MAX(o.object_id)),'') FROM sys.objects o "
+			                "JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE s.name=? AND o.name=? "
+			                "AND o.is_ms_shipped=0 AND o.type='U'",
+			                {i.schema, obj_name});
+		};
+		auto any_obj_exists = [&](const string &obj_name) {
+			return s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.objects o "
+			                "JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE s.name=? AND o.name=?",
+			                {i.schema, obj_name}) != "0";
+		};
+		auto check_col_dependencies = [&](const string &obj_id, const string &col_id) {
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.index_columns ic "
+			             "JOIN sys.indexes ix ON ix.object_id=ic.object_id AND ix.index_id=ic.index_id "
+			             "WHERE ic.object_id=" +
+			             obj_id + " AND ic.column_id=" + col_id + " AND ix.index_id>0") != "0") {
+				RejectDDL("2BP01", "source_definition", "cannot modify or drop column referenced by an index");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.foreign_key_columns "
+			             "WHERE (parent_object_id=" +
+			             obj_id + " AND parent_column_id=" + col_id + ") OR (referenced_object_id=" + obj_id +
+			             " AND referenced_column_id=" + col_id + ")") != "0") {
+				RejectDDL("2BP01", "source_definition",
+				          "cannot modify or drop column referenced by a foreign key constraint");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.check_constraints ch "
+			             "WHERE ch.parent_object_id=" +
+			             obj_id + " AND (ch.parent_column_id=" + col_id +
+			             " OR EXISTS (SELECT 1 FROM sys.sql_expression_dependencies ed "
+			             "WHERE ed.referencing_id=ch.object_id AND ed.referenced_id=" +
+			             obj_id + " AND ed.referenced_minor_id=" + col_id + "))") != "0") {
+				RejectDDL("2BP01", "source_definition",
+				          "cannot modify or drop column referenced by a check constraint");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.sql_expression_dependencies ed "
+			             "JOIN sys.objects o ON o.object_id=ed.referencing_id "
+			             "WHERE ed.referenced_id=" +
+			             obj_id + " AND (ed.referenced_minor_id=" + col_id +
+			             " OR ed.referenced_minor_id=0) AND o.type='V'") != "0") {
+				RejectDDL("2BP01", "source_definition", "cannot modify or drop column referenced by a view");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.sql_expression_dependencies ed "
+			             "WHERE ed.referenced_id=" +
+			             obj_id + " AND ed.referenced_minor_id=" + col_id +
+			             " AND ed.referencing_id <> COALESCE((SELECT default_object_id FROM sys.columns "
+			             "WHERE object_id=" +
+			             obj_id + " AND column_id=" + col_id + "),0)") != "0") {
+				RejectDDL("2BP01", "source_definition",
+				          "cannot modify or drop column with dependent objects or computed columns");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.stats_columns sc "
+			             "JOIN sys.stats st ON st.object_id=sc.object_id AND st.stats_id=sc.stats_id "
+			             "WHERE sc.object_id=" +
+			             obj_id + " AND sc.column_id=" + col_id + " AND st.user_created=1") != "0") {
+				RejectDDL("2BP01", "source_definition",
+				          "cannot modify or drop column referenced by user-created statistics");
+			}
+		};
+
+		string native_sql = i.sql;
+		bool sp_rename_op = false;
+		bool no_op_commit = false;
+		bool source_noop = false;
+
+		if (i.action == "create_table" || i.action == "create_table_as") {
+			if (!obj_id_of(i.name).empty()) {
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("42P07", "source_definition", "target object already exists");
 				}
-			} else if (d.intent.action == "create_index" || d.intent.action == "create_unique_index") {
-				if (count_query(
-				        "SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE "
-				        "s.name=? AND t.name=?",
-				        {d.intent.schema, d.intent.name})) {
-					idempotent_skip = count_query(
-					    "SELECT COUNT(*) FROM sys.indexes WHERE object_id=OBJECT_ID(?,N'U') AND name=?",
-					    {target, d.intent.index});
+			} else if (any_obj_exists(i.name)) {
+				RejectDDL("42P07", "source_definition", "target object already exists");
+			}
+		} else if (i.action == "drop_table") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				if (any_obj_exists(i.name)) {
+					RejectDDL("42809", "source_definition", "target object is not a base table");
 				}
-			} else if (d.intent.action == "drop_index") {
-				if (d.intent.owner.empty()) {
-					if (!count_query(
-					        "SELECT COUNT(*) FROM sys.indexes i JOIN sys.tables t ON t.object_id=i.object_id JOIN "
-					        "sys.schemas s ON s.schema_id=t.schema_id WHERE s.name=? AND i.name=?",
-					        {d.intent.schema, d.intent.name})) {
-						idempotent_skip = true;
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("42P01", "source_definition", "target table does not exist");
+				}
+			} else {
+				if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.foreign_keys WHERE referenced_object_id=" +
+				             obj_id + " AND parent_object_id<>" + obj_id) != "0") {
+					RejectDDL("2BP01", "source_definition", "cannot drop table with referencing foreign keys");
+				}
+			}
+		} else if (i.action == "create_schema") {
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.schemas WHERE name=?", {i.name}) != "0") {
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("42P06", "source_definition", "target schema already exists");
+				}
+			}
+		} else if (i.action == "drop_schema") {
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.schemas WHERE name=?", {i.name}) == "0") {
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("3F000", "source_definition", "target schema does not exist");
+				}
+			}
+		} else if (i.action == "rename_table") {
+			if (obj_id_of(i.name).empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			if (any_obj_exists(i.new_name)) {
+				RejectDDL("42P07", "source_definition", "destination table already exists");
+			}
+			sp_rename_op = true;
+		} else if (i.action == "add_column") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			const auto &c = i.column_defs[0];
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.columns WHERE object_id=" + obj_id +
+			             " AND name=?",
+			             {c.name}) != "0") {
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("42701", "source_definition", "column already exists");
+				}
+			} else if (c.not_null && (c.default_kind.empty() || c.default_kind == "null")) {
+				if (s.Scalar("SELECT CASE WHEN EXISTS(SELECT 1 FROM " + target + ") THEN '1' ELSE '0' END") == "1") {
+					RejectDDL("23502", "source_definition",
+					          "cannot add NOT NULL column without default to non-empty table");
+				}
+			}
+		} else if (i.action == "drop_column") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			auto col_rows = s.Query("SELECT CONVERT(varchar(20),c.column_id),COALESCE(dc.name,'') FROM sys.columns c "
+			                        "LEFT JOIN sys.default_constraints dc ON dc.object_id=c.default_object_id "
+			                        "WHERE c.object_id=" +
+			                            obj_id + " AND c.name=?",
+			                        {i.column_name});
+			if (col_rows.empty()) {
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("42703", "source_definition", "column does not exist");
+				}
+			} else {
+				if (std::stoi(s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.columns WHERE object_id=" +
+				                       obj_id)) <= 1) {
+					RejectDDL("42P16", "source_definition", "cannot drop the only column of a table");
+				}
+				check_col_dependencies(obj_id, col_rows[0][0]);
+				native_sql.clear();
+				if (!col_rows[0][1].empty()) {
+					native_sql = "ALTER TABLE " + target + " DROP CONSTRAINT " + Quote(col_rows[0][1]) + ";";
+				}
+				native_sql += "ALTER TABLE " + target + " DROP COLUMN " + Quote(i.column_name);
+			}
+		} else if (i.action == "alter_column_type") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			auto col_rows = s.Query(
+			    "SELECT ty.name,CONVERT(varchar(20),c.max_length),CONVERT(varchar(20),c.[precision]),"
+			    "CONVERT(varchar(20),c.[scale]),COALESCE(c.collation_name,''),CONVERT(varchar(5),c.is_computed),"
+			    "CONVERT(varchar(5),c.is_identity),CONVERT(varchar(5),c.is_nullable),"
+			    "CONVERT(varchar(5),ty.is_user_defined),CONVERT(varchar(20),c.column_id),"
+			    "COALESCE(dc.name,''),COALESCE(dc.definition,''),CONVERT(varchar(5),COALESCE(dc.is_system_named,1)) "
+			    "FROM sys.columns c JOIN sys.types ty ON ty.user_type_id=c.user_type_id "
+			    "LEFT JOIN sys.default_constraints dc ON dc.object_id=c.default_object_id "
+			    "WHERE c.object_id=" +
+			        obj_id + " AND c.name=?",
+			    {i.column_name});
+			if (col_rows.size() != 1) {
+				RejectDDL("42703", "source_definition", "column does not exist");
+			}
+			const auto &r = col_rows[0];
+			if (r[5] == "1" || r[6] == "1" || r[8] == "1") {
+				RejectDDL("0A000", "source_definition", "cannot alter computed, identity, or user-defined column");
+			}
+			check_col_dependencies(obj_id, r[9]);
+			const string ty = StringUtil::Lower(r[0]);
+			int max_len = std::stoi(r[1]);
+			int prec = std::stoi(r[2]);
+			int scale = std::stoi(r[3]);
+			const string collation = r[4];
+			const bool nullable = r[7] != "0";
+			const auto &target_col = i.column_defs[0];
+			bool widened = false;
+			string collate_clause;
+			if (ty == "smallint" && (target_col.type == "integer" || target_col.type == "bigint")) {
+				widened = true;
+			} else if (ty == "int" && target_col.type == "bigint") {
+				widened = true;
+			} else if ((ty == "real" || (ty == "float" && prec <= 24)) && target_col.type == "double") {
+				widened = true;
+			} else if ((ty == "decimal" || ty == "numeric") && target_col.type == "numeric") {
+				widened = target_col.scale == scale && target_col.precision > prec && target_col.precision <= 38;
+			} else if (ty == "nvarchar" && target_col.type == "varchar") {
+				if (max_len > 0 && (max_len % 2) == 0) {
+					int cur_len = max_len / 2;
+					if (target_col.length > cur_len && target_col.length <= 4000) {
+						widened = true;
+						if (!collation.empty()) {
+							collate_clause = " COLLATE " + SafeSQLServerCollation(collation);
+						}
+					}
+				}
+			} else if (ty == "time" && target_col.type == "time") {
+				widened = target_col.precision > scale && target_col.precision <= 6;
+			} else if (ty == "datetime2" && target_col.type == "timestamp") {
+				widened = target_col.precision > scale && target_col.precision <= 6;
+			} else if (ty == "datetimeoffset" && target_col.type == "timestamptz") {
+				widened = target_col.precision > scale && target_col.precision <= 6;
+			}
+			if (!widened) {
+				RejectDDL("0A000", "source_definition", "only lossless type widening is supported");
+			}
+			const string df_name = r[10];
+			const string df_def = r[11];
+			const bool df_sys_named = r[12] != "0";
+			const string alter_col_sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(i.column_name) + " " +
+			                             target_col.native_type + collate_clause + (nullable ? " NULL" : " NOT NULL");
+			if (!df_name.empty()) {
+				if (df_def.empty()) {
+					RejectDDL("0A000", "source_definition",
+					          "cannot preserve default constraint definition during alter_column_type");
+				}
+				const string add_df_sql =
+				    "ALTER TABLE " + target +
+				    (df_sys_named ? " ADD DEFAULT " : (" ADD CONSTRAINT " + Quote(df_name) + " DEFAULT ")) + df_def +
+				    " FOR " + Quote(i.column_name);
+				native_sql = "ALTER TABLE " + target + " DROP CONSTRAINT " + Quote(df_name) + ";" + alter_col_sql +
+				             ";" + add_df_sql;
+			} else {
+				native_sql = alter_col_sql;
+			}
+		} else if (i.action == "rename_column") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.columns WHERE object_id=" + obj_id +
+			             " AND name=?",
+			             {i.column_name}) == "0") {
+				RejectDDL("42703", "source_definition", "column does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.columns WHERE object_id=" + obj_id +
+			             " AND name=?",
+			             {i.new_name}) != "0") {
+				RejectDDL("42701", "source_definition", "destination column already exists");
+			}
+			sp_rename_op = true;
+		} else if (i.action == "set_default" || i.action == "drop_default") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			auto col_rows = s.Query("SELECT COALESCE(dc.name,'') FROM sys.columns c "
+			                        "LEFT JOIN sys.default_constraints dc ON dc.object_id=c.default_object_id "
+			                        "WHERE c.object_id=" +
+			                            obj_id + " AND c.name=?",
+			                        {i.column_name});
+			if (col_rows.size() != 1) {
+				RejectDDL("42703", "source_definition", "column does not exist");
+			}
+			string existing_df = col_rows[0][0];
+			if (i.action == "drop_default") {
+				if (existing_df.empty()) {
+					no_op_commit = true;
+				} else {
+					native_sql = "ALTER TABLE " + target + " DROP CONSTRAINT " + Quote(existing_df);
+				}
+			} else {
+				native_sql.clear();
+				if (!existing_df.empty()) {
+					native_sql = "ALTER TABLE " + target + " DROP CONSTRAINT " + Quote(existing_df) + ";";
+				}
+				native_sql += i.sql;
+			}
+		} else if (i.action == "set_not_null" || i.action == "drop_not_null") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			auto col_rows = s.Query(
+			    "SELECT ty.name,CONVERT(varchar(20),c.max_length),CONVERT(varchar(20),c.[precision]),"
+			    "CONVERT(varchar(20),c.[scale]),COALESCE(c.collation_name,''),CONVERT(varchar(5),c.is_computed),"
+			    "CONVERT(varchar(5),c.is_identity),CONVERT(varchar(5),c.is_nullable),"
+			    "CONVERT(varchar(5),ty.is_user_defined) "
+			    "FROM sys.columns c JOIN sys.types ty ON ty.user_type_id=c.user_type_id "
+			    "WHERE c.object_id=" +
+			        obj_id + " AND c.name=?",
+			    {i.column_name});
+			if (col_rows.size() != 1) {
+				RejectDDL("42703", "source_definition", "column does not exist");
+			}
+			string col_type = BuildSQLServerAlterColumnType(col_rows[0]);
+			native_sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(i.column_name) + " " + col_type +
+			             (i.action == "set_not_null" ? " NOT NULL" : " NULL");
+		} else if (i.action == "add_constraint") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			if (any_obj_exists(i.constraint_name)) {
+				RejectDDL("42710", "source_definition", "constraint name already exists");
+			}
+			if (i.constraint_kind == "foreign_key") {
+				if (i.reference_schema != i.schema) {
+					RejectDDL("0A000", "source_definition", "foreign key schema must match source schema");
+				}
+				if (obj_id_of(i.reference_table).empty()) {
+					RejectDDL("42P01", "source_definition", "referenced table does not exist");
+				}
+			}
+		} else if (i.action == "drop_constraint") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.objects WHERE parent_object_id=" + obj_id +
+			             " AND name=? AND type IN('PK','UQ','F','C','D')",
+			             {i.constraint_name}) == "0") {
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("42704", "source_definition", "constraint does not exist");
+				}
+			}
+		} else if (i.action == "create_index" || i.action == "create_unique_index") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.indexes WHERE object_id=" + obj_id +
+			             " AND name=?",
+			             {i.index}) != "0") {
+				if (i.conditional) {
+					source_noop = true;
+				} else {
+					RejectDDL("42P07", "source_definition", "index already exists on table");
+				}
+			}
+		} else if (i.action == "drop_index") {
+			if (i.owner.empty()) {
+				if (!i.conditional) {
+					RejectDDL("0A000", "source_definition", "owning table required for SQL Server DROP INDEX");
+				}
+				if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.indexes ix "
+				             "JOIN sys.tables t ON t.object_id=ix.object_id "
+				             "JOIN sys.schemas s ON s.schema_id=t.schema_id "
+				             "WHERE s.name=? AND ix.name=? AND t.is_ms_shipped=0 AND ix.index_id>0",
+				             {i.schema, i.name}) == "0") {
+					source_noop = true;
+				} else {
+					RejectDDL("0A000", "source_definition", "owning table required for SQL Server DROP INDEX");
+				}
+			} else {
+				auto obj_id = obj_id_of(i.owner);
+				if (obj_id.empty()) {
+					if (i.conditional) {
+						source_noop = true;
 					} else {
-						error = "0A000";
-						throw IOException("SQL Server DROP INDEX requires owning table");
+						RejectDDL("42P01", "source_definition", "owning table does not exist");
 					}
 				} else {
-					const auto owner_target = Quote(d.intent.schema) + "." + Quote(d.intent.owner);
-					idempotent_skip = !count_query(
-					    "SELECT COUNT(*) FROM sys.indexes WHERE object_id=OBJECT_ID(?,N'U') AND name=?",
-					    {owner_target, d.intent.name});
-				}
-			} else if (d.intent.action == "drop_constraint") {
-				if (count_query(
-				        "SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE "
-				        "s.name=? AND t.name=?",
-				        {d.intent.schema, d.intent.name})) {
-					idempotent_skip = !count_query(
-					    "SELECT COUNT(*) FROM sys.objects WHERE parent_object_id=OBJECT_ID(?,N'U') AND name=? AND "
-					    "type IN('PK','UQ','F','C','D')",
-					    {target, d.intent.constraint_name});
+					auto ix_rows = s.Query("SELECT CONVERT(varchar(5),is_primary_key),"
+					                       "CONVERT(varchar(5),is_unique_constraint) "
+					                       "FROM sys.indexes WHERE object_id=" +
+					                           obj_id + " AND name=? AND index_id>0",
+					                       {i.name});
+					if (ix_rows.empty()) {
+						if (i.conditional) {
+							source_noop = true;
+						} else {
+							RejectDDL("42704", "source_definition", "index does not exist");
+						}
+					} else if (ix_rows[0][0] == "1" || ix_rows[0][1] == "1") {
+						RejectDDL("2BP01", "source_definition", "cannot drop constraint backing index directly");
+					}
 				}
 			}
+		} else if (i.action == "rename_index") {
+			auto obj_id = obj_id_of(i.owner);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "owning table does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.indexes WHERE object_id=" + obj_id +
+			             " AND name=? AND index_id>0",
+			             {i.name}) == "0") {
+				RejectDDL("42704", "source_definition", "index does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.indexes WHERE object_id=" + obj_id +
+			             " AND name=?",
+			             {i.new_name}) != "0") {
+				RejectDDL("42P07", "source_definition", "destination index already exists");
+			}
+			sp_rename_op = true;
+		} else if (i.action == "truncate") {
+			auto obj_id = obj_id_of(i.name);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "target table does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.foreign_keys WHERE referenced_object_id=" +
+			             obj_id) != "0") {
+				RejectDDL("2BP01", "source_definition", "cannot truncate table with referencing foreign keys");
+			}
+			if (i.identity_mode == "continue" &&
+			    s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.columns WHERE object_id=" + obj_id +
+			             " AND is_identity=1") != "0") {
+				RejectDDL("0A000", "source_definition",
+				          "TRUNCATE CONTINUE IDENTITY is not supported on SQL Server identity columns");
+			}
+		} else if (i.action == "reindex") {
+			auto obj_id = obj_id_of(i.owner);
+			if (obj_id.empty()) {
+				RejectDDL("42P01", "source_definition", "owning table does not exist");
+			}
+			if (s.Scalar("SELECT CONVERT(varchar(20),COUNT(*)) FROM sys.indexes WHERE object_id=" + obj_id +
+			             " AND name=? AND index_id>0",
+			             {i.name}) == "0") {
+				RejectDDL("42704", "source_definition", "index does not exist");
+			}
+		} else {
+			RejectDDL("0A000", "source_definition", "unsupported SQL Server DDL action");
 		}
 
-		string native_sql = d.intent.sql;
-		if (!idempotent_skip && d.intent.action == "alter_column_type") {
-			auto rows = session->Query("SELECT CONVERT(varchar(1),c.is_nullable) FROM sys.columns c WHERE "
-			                           "c.object_id=OBJECT_ID(?,N'U') AND c.name=?",
-			                           {target, d.intent.column_name});
-			if (rows.size() == 1)
-				native_sql += (rows[0][0] == "0" ? " NOT NULL" : " NULL");
-		} else if (!idempotent_skip && (d.intent.action == "set_not_null" || d.intent.action == "drop_not_null")) {
-			auto rows = session->Query("SELECT TYPE_NAME(c.user_type_id),c.max_length,c.[precision],c.[scale] "
-			                           "FROM sys.columns c WHERE c.object_id=OBJECT_ID(?,N'U') AND c.name=?",
-			                           {target, d.intent.column_name});
-			if (rows.size() != 1) {
-				error = "42703";
-				throw IOException("SQL Server DDL column unavailable");
-			}
-			auto col_type =
-			    FormatMssqlColumnType(rows[0][0], std::stoi(rows[0][1]), std::stoi(rows[0][2]), std::stoi(rows[0][3]));
-			native_sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(d.intent.column_name) + " " + col_type +
-			             (d.intent.action == "set_not_null" ? " NOT NULL" : " NULL");
-		} else if (!idempotent_skip && d.intent.action == "drop_default") {
-			auto rows = session->Query("SELECT dc.name FROM sys.default_constraints dc WHERE "
-			                           "dc.parent_object_id=OBJECT_ID(?,N'U') AND "
-			                           "dc.parent_column_id=COLUMNPROPERTY(OBJECT_ID(?,N'U'),?,N'ColumnId')",
-			                           {target, target, d.intent.column_name});
-			if (rows.size() != 1) {
-				error = "42704";
-				throw IOException("SQL Server column default constraint not found");
-			}
-			native_sql = "ALTER TABLE " + target + " DROP CONSTRAINT " + Quote(rows[0][0]);
-		}
-
-		if (!idempotent_skip) {
-			stage = "source_execute";
+		stage = "source_execute";
+		s.current_stage = "source_execute";
+		if (!no_op_commit && !source_noop) {
 			if (ctx.IsInterrupted()) {
-				error = "57014";
-				throw InterruptException();
+				RejectDDL("57014", "source_execute", "operation cancelled");
 			}
+			s.last_warning_count = 0;
 			sent = true;
-			session->Exec(native_sql);
+			s.Exec(native_sql, false, sp_rename_op);
+			if (s.Scalar("SELECT CASE WHEN @@TRANCOUNT=1 AND XACT_STATE()=1 THEN '1' ELSE '0' END") != "1") {
+				RejectDDL("40001", "source_execute", "SQL Server DDL transaction invalidated before commit");
+			}
 		}
 
 		stage = "source_commit";
+		s.current_stage = "source_commit";
 		commit_sent = true;
 		status = "UNKNOWN";
-		session->Exec("COMMIT TRANSACTION");
+		s.Exec("COMMIT TRANSACTION");
+		if (s.Scalar("SELECT CASE WHEN @@TRANCOUNT=0 AND XACT_STATE()=0 THEN '1' ELSE '0' END") != "1") {
+			RejectDDL("40001", "source_commit", "SQL Server DDL commit verification failed");
+		}
 		in_tx = false;
 		status = "COMMITTED";
-		stage.clear();
-	} catch (...) {
-		if (session) {
-			source = session->source;
-			if (error.empty())
-				error = session->sqlstate;
+		if (source_noop) {
+			warnings = 0;
+			error.clear();
+			stage = "source_noop";
+		} else {
+			warnings = s.last_warning_count;
+			error.clear();
+			stage = warnings > 0 ? "source_warning" : "";
 		}
-		if (error.empty())
-			error = ctx.IsInterrupted() ? "57014" : "08006";
-		if (sent && status != "COMMITTED") {
-			status = "UNKNOWN";
-			if (in_tx && !commit_sent && session && session->TryExec("IF @@TRANCOUNT>0 ROLLBACK TRANSACTION")) {
-				status = "CONFIRMED_ROLLED_BACK";
-				in_tx = false;
+	} catch (const GuardedODBCLocalRejection &) {
+		error = status == "COMMITTED" ? "XX000" : "0A000";
+		stage = "source_identity";
+	} catch (const DDLRejectException &rej) {
+		if (source_error.empty() && session) {
+			source_error = session->source.JSON();
+		}
+		error = ValidSQLState(rej.sqlstate, "HY000");
+		stage = rej.stage;
+	} catch (...) {
+		if (source_error.empty() && session) {
+			source_error = session->source.JSON();
+		}
+		error = session && !session->sqlstate.empty()
+		            ? session->sqlstate
+		            : (ctx.IsInterrupted() ? "57014" : "08006");
+	}
+
+	if (status != "COMMITTED" && in_tx && session) {
+		try {
+			session->Exec("IF @@TRANCOUNT>0 ROLLBACK TRANSACTION", true);
+			auto state_after =
+			    session->Scalar("SELECT CASE WHEN @@TRANCOUNT=0 AND XACT_STATE()=0 THEN '1' ELSE '0' END", {}, true);
+			if (state_after == "1" && !commit_sent) {
+				status = sent ? "CONFIRMED_ROLLED_BACK" : "CONFIRMED_NOT_EXECUTED";
+				if (stage == "source_lock" || stage == "source_definition") {
+					if (status != "CONFIRMED_NOT_EXECUTED") {
+						stage = "source_execute";
+					}
+				}
+			} else if (sent || commit_sent) {
+				status = "UNKNOWN";
 			}
-		} else if (in_tx && session) {
-			session->TryExec("IF @@TRANCOUNT>0 ROLLBACK TRANSACTION");
-			in_tx = false;
+		} catch (...) {
+			if (sent || commit_sent) {
+				status = "UNKNOWN";
+			}
 		}
 	}
+	if (status == "CONFIRMED_ROLLED_BACK" && (stage == "source_lock" || stage == "source_definition")) {
+		stage = "source_execute";
+	}
+	if (status != "COMMITTED") {
+		warnings = 0;
+		if (stage == "source_warning" || stage == "source_verify") {
+			stage = "source_execute";
+		}
+		error = ValidSQLState(error, "HY000");
+	}
+
+	session.reset();
 	if (connection)
 		connection->Close();
-	out.SetValue(0, 0, Value(d.intent.operation));
+	out.SetValue(0, 0, Value(i.operation));
 	out.SetValue(1, 0, Value(status));
 	out.SetValue(2, 0, Value(error));
 	out.SetValue(3, 0, Value(stage));
-	out.SetValue(4, 0, Value::BIGINT(0));
+	out.SetValue(4, 0, Value::BIGINT(warnings));
 	if (d.diagnostics)
-		out.SetValue(5, 0, Value(source.JSON()));
+		out.SetValue(5, 0, Value(source_error));
 	out.SetChildCardinality(1);
 }
 
@@ -1088,7 +1894,11 @@ static void ScanDDL(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) 
 void RegisterSQLServerGuardedDDL(ExtensionLoader &loader) {
 	loader.RegisterFunction(
 	    TableFunction("sqlserver_ddl_capabilities", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                  ScanCapabilities, BindCapabilities, InitOne));
+	                  ScanMetadata, BindMetadata, InitOne));
+	loader.RegisterFunction(TableFunction(
+	    "sqlserver_ddl_describe",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ScanMetadata,
+	    BindMetadata, InitOne));
 	TableFunction ddl("sqlserver_guarded_ddl",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                   LogicalType::ANY},

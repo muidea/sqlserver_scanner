@@ -31,6 +31,7 @@ struct ODBCTableInfo {
 
 	unique_ptr<CreateTableInfo> create_info;
 	vector<string> remote_column_names;
+	vector<string> remote_type_names;
 	bool is_view = false;
 };
 
@@ -52,6 +53,7 @@ public:
 	                           ClientContext &context) override;
 
 	vector<string> remote_column_names;
+	vector<string> remote_type_names;
 	bool IsView() const {
 		return is_view;
 	}

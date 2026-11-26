@@ -115,6 +115,7 @@ ORDER BY t.name, c.colid
 		ColumnDefinition column(Identifier(std::move(column_name)), ODBCTypes::TypeToLogicalType(type_config, type_info));
 		table_info->create_info->columns.AddColumn(std::move(column));
 		table_info->remote_column_names.push_back(std::move(remote_column_name));
+		table_info->remote_type_names.push_back(type_info.type_name);
 	}
 
 	for (auto &entry : table_infos) {
@@ -144,6 +145,7 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 		ColumnDefinition column(Identifier(std::move(column_name)), field.duckdb_type);
 		table_info->create_info->columns.AddColumn(std::move(column));
 		table_info->remote_column_names.push_back(std::move(remote_column_name));
+		table_info->remote_type_names.push_back(StringUtil::Lower(field.type_name));
 	}
 	return table_info;
 }
