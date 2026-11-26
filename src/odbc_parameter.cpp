@@ -141,6 +141,7 @@ ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::mo
 		break;
 	case LogicalTypeId::DECIMAL:
 	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UUID:
 	case LogicalTypeId::VARCHAR:
 		this->buffer_type = SQL_VARCHAR;
 		break;

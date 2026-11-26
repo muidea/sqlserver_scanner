@@ -3,12 +3,15 @@
 #include "odbc_connection.hpp"
 #include "storage/odbc_connection_pool.hpp"
 
+#include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "odbc_types.hpp"
 #include <sql.h>
 #include <sqlext.h>
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <cstring>
@@ -160,23 +163,36 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		field.odbc_type = data_type;
 		field.c_type = ODBCTypes::GetCType(data_type);
 		auto lower_type_name = StringUtil::Lower(type_name);
-		if (ltype.id() == LogicalTypeId::TIMESTAMP) {
-			field.c_type = SQL_C_TYPE_TIMESTAMP;
-		} else if (lower_type_name == "datetimeoffset") {
+		if (field.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ || lower_type_name == "datetimeoffset") {
 			// Preserve the UTC offset text; SQL_TIMESTAMP_STRUCT has no offset field.
 			field.c_type = SQL_C_CHAR;
-		} else if (ltype.id() == LogicalTypeId::DECIMAL || ltype.id() == LogicalTypeId::DOUBLE) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::TIME) {
+			// Preserve sub-second microseconds; SQL_TIME_STRUCT drops fractional seconds.
 			field.c_type = SQL_C_CHAR;
-		} else if (ltype.id() == LogicalTypeId::FLOAT) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::UUID) {
+			field.c_type = SQL_C_CHAR;
+		} else if (field.duckdb_type.id() == LogicalTypeId::TIMESTAMP) {
+			field.c_type = SQL_C_TYPE_TIMESTAMP;
+		} else if (field.duckdb_type.id() == LogicalTypeId::DECIMAL ||
+		           (field.duckdb_type.id() == LogicalTypeId::DOUBLE &&
+		            (lower_type_name == "decimal" || lower_type_name == "numeric" || lower_type_name == "money" ||
+		             lower_type_name == "smallmoney"))) {
+			field.c_type = SQL_C_CHAR;
+		} else if (field.duckdb_type.id() == LogicalTypeId::FLOAT) {
 			field.c_type = SQL_C_FLOAT;
-		} else if (ltype.id() == LogicalTypeId::DOUBLE) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::DOUBLE) {
 			field.c_type = SQL_C_DOUBLE;
-		} else if (ltype.id() == LogicalTypeId::BLOB) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::BLOB) {
 			field.c_type = SQL_C_BINARY;
 		}
 
 		// Resize buffer based on ODBC type
 		size_t buf_size = GetBufferSize(field.c_type, column_size);
+		if (field.c_type == SQL_C_CHAR &&
+		    (field.duckdb_type.id() == LogicalTypeId::UUID || field.duckdb_type.id() == LogicalTypeId::TIME ||
+		     field.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ)) {
+			buf_size = MaxValue<size_t>(buf_size, DEFAULT_BIND_BUFFER_SIZE);
+		}
 		field.bind_buffer.resize(buf_size);
 
 		fields.emplace_back(std::move(field));
@@ -858,6 +874,45 @@ static void WriteNumber(ODBCField &f, Vector &vec, idx_t row) {
 	data[row] = num;
 }
 
+static void WriteUUID(ODBCField &f, Vector &vec, idx_t row) {
+	if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+		throw ConversionException("ODBC UUID value has an invalid transfer length");
+	}
+	auto text_len = strnlen(f.ValueData(), static_cast<size_t>(f.bind_length));
+	string text(f.ValueData(), text_len);
+	StringUtil::Trim(text);
+	hugeint_t uuid_val;
+	if (!UUID::FromString(text, uuid_val)) {
+		throw ConversionException("Invalid ODBC UUID value: \"%s\"", text);
+	}
+	FlatVector::GetData<hugeint_t>(vec)[row] = uuid_val;
+}
+
+static string NormalizeTimestampTZText(string text) {
+	StringUtil::Trim(text);
+	auto date_time_sep = text.find_first_of(" T");
+	if (date_time_sep == string::npos) {
+		return text;
+	}
+	auto offset_pos = text.find_first_of("+-Zz", date_time_sep + 1);
+	if (offset_pos == string::npos) {
+		return text;
+	}
+	auto prefix = text.substr(0, offset_pos);
+	StringUtil::Trim(prefix);
+	auto suffix = text.substr(offset_pos);
+	StringUtil::Trim(suffix);
+	if (suffix == "z" || suffix == "Z") {
+		return prefix + "Z";
+	}
+	if ((suffix[0] == '+' || suffix[0] == '-') && suffix.size() >= 2 &&
+	    std::isdigit(static_cast<unsigned char>(suffix[1])) &&
+	    (suffix.size() == 2 || !std::isdigit(static_cast<unsigned char>(suffix[2])))) {
+		suffix.insert(1, 1, '0');
+	}
+	return prefix + suffix;
+}
+
 static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 	if (vec.GetType().id() == LogicalTypeId::DATE) {
 		D_ASSERT(f.bind_buffer.size() >= sizeof(SQL_DATE_STRUCT));
@@ -866,10 +921,43 @@ static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 	if (vec.GetType().id() == LogicalTypeId::TIME) {
+		if (f.c_type == SQL_C_CHAR) {
+			if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+				throw ConversionException("ODBC TIME value has an invalid transfer length");
+			}
+			auto text_len = strnlen(f.ValueData(), static_cast<size_t>(f.bind_length));
+			string text(f.ValueData(), text_len);
+			StringUtil::Trim(text);
+			idx_t pos = 0;
+			dtime_t tm;
+			if (!Time::TryConvertTime(text.c_str(), text.size(), pos, tm, true)) {
+				throw ConversionException("Invalid ODBC TIME value: \"%s\"", text);
+			}
+			FlatVector::GetData<dtime_t>(vec)[row] = tm;
+			return;
+		}
 		D_ASSERT(f.bind_buffer.size() >= sizeof(SQL_TIME_STRUCT));
 		auto *time_value = reinterpret_cast<SQL_TIME_STRUCT *>(f.bind_buffer.data());
 		FlatVector::GetData<dtime_t>(vec)[row] =
 		    Time::FromTime(time_value->hour, time_value->minute, time_value->second, 0);
+		return;
+	}
+	if (vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ && f.c_type == SQL_C_CHAR) {
+		if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+			throw ConversionException("ODBC TIMESTAMP_TZ value has an invalid transfer length");
+		}
+		auto text_len = strnlen(f.ValueData(), static_cast<size_t>(f.bind_length));
+		string text(f.ValueData(), text_len);
+		auto normalized = NormalizeTimestampTZText(std::move(text));
+		timestamp_t ts_val;
+		bool has_offset = false;
+		string_t tz(nullptr, 0);
+		if (Timestamp::TryConvertTimestampTZ(normalized.c_str(), normalized.size(), ts_val, true, has_offset, tz) !=
+		        TimestampCastResult::SUCCESS ||
+		    !has_offset || tz.GetSize() != 0) {
+			throw ConversionException("Invalid ODBC TIMESTAMP WITH TIME ZONE value: \"%s\"", normalized);
+		}
+		FlatVector::GetData<timestamp_tz_t>(vec)[row] = timestamp_tz_t(ts_val.value);
 		return;
 	}
 
@@ -1010,6 +1098,10 @@ void ODBCResult::WriteToChunk(DataChunk &chunk, idx_t row) {
 			case LogicalTypeId::TIMESTAMP:
 			case LogicalTypeId::TIMESTAMP_TZ: {
 				WriteDateTime(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::UUID: {
+				WriteUUID(f, vec, row);
 				break;
 			}
 			default: {

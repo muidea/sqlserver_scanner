@@ -15,6 +15,7 @@
 #include <sqlext.h>
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include "storage/odbc_schema_entry.hpp"
 #include "storage/odbc_transaction.hpp"
@@ -469,14 +470,18 @@ static string TransformBlobToODBC(const string &val) {
 }
 
 string ODBCUtils::TransformConstant(const Value &val) {
-	if (val.type().IsNumeric() || val.type().id() == LogicalTypeId::BOOLEAN) {
+	if (val.type().id() == LogicalTypeId::BOOLEAN) {
+		return BooleanValue::Get(val) ? "1" : "0";
+	}
+	if (val.type().IsNumeric()) {
 		return val.ToSQLString();
 	}
 	if (val.type().id() == LogicalTypeId::BLOB) {
 		return TransformBlobToODBC(StringValue::Get(val));
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+		auto ts_text = Timestamp::ToString(timestamp_t(val.GetValueUnsafe<int64_t>())) + "+00:00";
+		return WriteLiteral(ts_text);
 	}
 	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
 }

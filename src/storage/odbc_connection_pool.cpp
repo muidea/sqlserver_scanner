@@ -55,7 +55,7 @@ ODBCPoolConnection ODBCConnectionPool::GetConnectionInternal() {
 	}
 
 	// no cached connections left but there is space to open a new one - open it
-	ODBCTypeConfig type_config;
+	ODBCTypeConfig type_config(odbc_catalog.GetDatabase());
 	auto connection = ODBCConnection::Open(type_config, odbc_catalog.connection_string);
 	active_connections++;
 	return ODBCPoolConnection(this, std::move(connection));

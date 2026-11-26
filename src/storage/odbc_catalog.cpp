@@ -29,7 +29,7 @@ ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, str
 		connection_pool.SetMaximumConnections(UBigIntValue::Get(connection_limit));
 	}
 	// try to connect
-	ODBCTypeConfig type_config; // 使用默认构造函数
+	ODBCTypeConfig type_config(db_instance);
 	auto connection = ODBCConnection::Open(type_config, connection_string);
 	if (default_schema.empty()) {
 		try {

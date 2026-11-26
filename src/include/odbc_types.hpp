@@ -46,10 +46,11 @@ struct ODBCType {
 struct ODBCTypeConfig {
 	bool bit1_as_boolean = false;
 	bool tinyint1_as_boolean = false;
-	bool time_as_time = false;
+	bool time_as_time = true;
 
 	ODBCTypeConfig();
-	ODBCTypeConfig(ClientContext &context);
+	explicit ODBCTypeConfig(ClientContext &context);
+	explicit ODBCTypeConfig(DatabaseInstance &db);
 };
 
 class ODBCTypes {

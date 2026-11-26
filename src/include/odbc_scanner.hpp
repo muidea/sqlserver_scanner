@@ -85,4 +85,9 @@ public:
 	static void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter);
 };
 
+class ODBCClearCacheScopedFunction : public TableFunction {
+public:
+	ODBCClearCacheScopedFunction();
+};
+
 } // namespace duckdb
